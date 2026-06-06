@@ -1,0 +1,71 @@
+services:
+  # ──────────────────────────────────────────────
+  # Ollama - 本地小模型（CPU 推理，无显卡可用）
+  # ──────────────────────────────────────────────
+  ollama:
+    image: docker.m.daocloud.io/ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    restart: unless-stopped
+    networks:
+      - nat
+
+  # ──────────────────────────────────────────────
+  # Agent Mind - 意识层 / 心跳 / 状态机（独立运行，无需 VCPToolBox）
+  # ──────────────────────────────────────────────
+  agent-mind:
+    build: ./agent-mind
+    container_name: agent-mind
+    ports:
+      - "8000:8000"
+    environment:
+      TZ: ${DEFAULT_TIMEZONE:-Asia/Shanghai}
+      # 本地小模型（Ollama，可通过 LOCAL_MODEL_ENABLED=false 禁用调用）
+      LOCAL_MODEL_ENABLED: ${LOCAL_MODEL_ENABLED:-true}
+      OLLAMA_URL: http://ollama:11434
+      LOCAL_MODEL: ${LOCAL_MODEL:-qwen2.5:3b}
+      # 工作/学习大模型（OpenAI 兼容接口，用于用户对话、作业、学习和工具任务）
+      WORK_API_URL: ${WORK_API_URL:-${CLOUD_API_URL:-}}
+      WORK_API_KEY: ${WORK_API_KEY:-${CLOUD_API_KEY:-}}
+      WORK_MODEL: ${WORK_MODEL:-${CLOUD_MODEL:-gpt-5.5}}
+      # 心跳/反思模型（OpenAI 兼容接口，用于自主反思、用户印象、记忆压缩）
+      REFLECT_API_URL: ${REFLECT_API_URL:-${WORK_API_URL:-${CLOUD_API_URL:-}}}
+      REFLECT_API_KEY: ${REFLECT_API_KEY:-${WORK_API_KEY:-${CLOUD_API_KEY:-}}}
+      REFLECT_MODEL: ${REFLECT_MODEL:-gpt-5.5}
+      # 旧版云端大模型配置（兼容保留）
+      CLOUD_API_URL: ${CLOUD_API_URL:-}
+      CLOUD_API_KEY: ${CLOUD_API_KEY:-}
+      CLOUD_MODEL: ${CLOUD_MODEL:-gpt-5.5}
+      # 心跳配置
+      TICK_INTERVAL_SECONDS: ${TICK_INTERVAL_SECONDS:-15}
+      REFLECT_EVERY_N_TICKS: ${REFLECT_EVERY_N_TICKS:-20}
+      # 预算控制
+      HOURLY_CLOUD_LIMIT: ${HOURLY_CLOUD_LIMIT:-9999}
+      HOURLY_WORK_LIMIT: ${HOURLY_WORK_LIMIT:-${HOURLY_CLOUD_LIMIT:-9999}}
+      HOURLY_REFLECT_LIMIT: ${HOURLY_REFLECT_LIMIT:-${HOURLY_CLOUD_LIMIT:-9999}}
+      # 日记存储目录
+      DIARY_DIR: /app/data/diary
+      # 结构化记忆存储目录（参考 Claude Code memdir 设计）
+      MEMORIES_DIR: /app/data/memories
+    volumes:
+      - ./agent-mind:/app
+      - agent_data:/app/data
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    networks:
+      - nat
+
+volumes:
+  ollama_data:
+  agent_data:
+
+networks:
+  nat:
+    driver: bridge

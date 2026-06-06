@@ -1,0 +1,49 @@
+# 临时部署/诊断脚本
+.tmp_*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# 环境变量（含密钥，不上传）
+.env
+.env.remote
+
+# 编辑器
+.vscode/
+.idea/
+
+# 日志
+*.log
+*.txt.bak
+
+# 打包文件
+*.tgz
+*.tar.gz
+*.zip
+*.b64
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ToCodex / local automation workspace files
+.tocodex/
+.playwright-mcp/
+
+# Runtime data and private memory
+agent-mind/data/users/
+agent-mind/data/diary/
+agent-mind/data/memories/
+agent-mind/data/experiments/
+agent-mind/data/evolution/
+agent-mind/data/evolution-test/
+agent-mind/data/*.jsonl

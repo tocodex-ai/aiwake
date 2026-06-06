@@ -1,0 +1,55 @@
+app = "aiwake"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+  LOCAL_MODEL_ENABLED = "false"
+  DEFAULT_TIMEZONE = "Asia/Shanghai"
+  DIARY_DIR = "/app/data/diary"
+  TICK_INTERVAL_SECONDS = "15"
+  REFLECT_EVERY_N_TICKS = "4"
+  REFLECT_MAX_ROUNDS = "2"
+  CHAT_RATE_WINDOW_SECONDS = "10"
+  CHAT_RATE_MAX_REQUESTS = "3"
+  PUBLIC_TOOL_API_ENABLED = "false"
+  WORK_MODEL = "gpt-5.5"
+  REFLECT_MODEL = "gpt-5.5"
+  CLOUD_MODEL = "gpt-5.5"
+  PROACTIVE_COOLDOWN_SECONDS = "300"
+  PROACTIVE_CS_THRESHOLD = "0.55"
+  PROACTIVE_IDLE_SECONDS = "120"
+  HOURLY_WORK_LIMIT = "20"
+  HOURLY_REFLECT_LIMIT = "60"
+  EVOLUTION_LOOP_ENABLED = "true"
+  EVOLUTION_INTERVAL_SECONDS = "3600"
+  EVOLUTION_STARTUP_DELAY_SECONDS = "45"
+  EVOLUTION_WINDOW_HOURS = "24"
+  EVOLUTION_DIR = "/app/data/evolution"
+  EVOLUTION_UPGRADE_PROPOSAL_ENABLED = "true"
+  EVOLUTION_UPGRADE_AUTO_VALIDATE = "true"
+  EVOLUTION_UPGRADE_HUMAN_APPROVAL_REQUIRED = "false"
+  EVOLUTION_UPGRADE_APPLY_ENABLED = "true"
+  EVOLUTION_UPGRADE_DEPLOY_ENABLED = "true"
+
+[mounts]
+  source = "aiwake_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

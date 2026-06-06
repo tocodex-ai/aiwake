@@ -1,0 +1,16 @@
+.git
+.gitignore
+.tocodex
+.playwright-mcp
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.*
+*.log
+node_modules
+tocodex-docs
