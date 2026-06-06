@@ -103,19 +103,45 @@ class ToolRouter:
         """为工具失败补充稳定的分类与降级路径，帮助下一轮反思可直接行动。"""
         status = str(result.get("status") or "").lower()
         error_text = str(result.get("error") or result.get("result") or "")
-        if not result.get("error") and status not in {"error", "degraded"}:
+        diagnosis_text = str(result.get("diagnosis") or result.get("diagnostic") or "")
+        http_status = result.get("http_status")
+        empty_ok = (
+            tool_name in {"daily_note_read", "knowledge_search"}
+            and status == "ok"
+            and not result.get("error")
+            and self._looks_empty_result(result.get("result"))
+        )
+        if not empty_ok and not result.get("error") and status not in {"error", "degraded"}:
             return result
 
-        combined = f"{tool_name} {status} {error_text}".lower()
-        if tool_name in {"web_search", "web_fetch", "url_fetch", "weather", "arxiv_search"}:
+        combined = f"{tool_name} {status} {error_text} {diagnosis_text}".lower()
+        if empty_ok:
+            failure_type = "empty_result"
+            fallback_hint = "工具可用但结果为空；改用明确日期/更具体关键词重试，并用写入记录、公开状态或活动日志交叉验证，不能据此断言记忆不存在。"
+        elif str(result.get("diagnosis") or "") == "api_path_misuse" or self._looks_like_api_path_misuse(combined):
+            failure_type = "execution_context_mismatch/tool_path_boundary_misuse"
+            fallback_hint = "这是 HTTP/API 路由与本地文件/命令上下文混用；改用 web_fetch/url_fetch 读取公网 HTTPS 端点，或使用结构化状态接口，不要用 shell cat/file_read 读取 API 路径。"
+        elif "非公网地址" in error_text or "private network" in combined or "localhost" in combined or "127.0.0.1" in combined:
+            failure_type = "private_network_safety_restriction"
+            fallback_hint = "web_fetch 出于 SSRF 防护拒绝私网/localhost；改用公开 HTTPS 地址或只读公开接口，不要尝试绕过安全限制。"
+        elif http_status in {404, 410}:
+            failure_type = "external_content_not_found/content_stale"
+            fallback_hint = "记录 URL、final_url 与 HTTP 状态；换可信来源重试，或把该网页标记为内容过期/不可用证据，不要判定网络工具整体故障。"
+        elif http_status in {401, 403}:
+            failure_type = "external_access_restricted"
+            fallback_hint = "目标站点拒绝公开抓取；换公开来源或搜索摘要，不要访问凭据或尝试绕过登录/地区/机器人限制。"
+        elif http_status in {429, 503}:
+            failure_type = "external_rate_limited_or_unavailable"
+            fallback_hint = "外部站点限流/临时不可用；退避后重试一次，或改用等价网络工具与公开接口。"
+        elif "timeout" in combined or "超时" in error_text:
+            failure_type = "readonly_observation_timeout" if tool_name in {"web_fetch", "url_fetch", "file_read", "knowledge_search", "daily_note_read"} else "aiwake_tool_timeout"
+            fallback_hint = "降低 limit/缩短 hours/拆分任务后重试一次；修复后用 cache.mode、耗时、任务-artifact 匹配关系交叉验证。"
+        elif tool_name in {"web_search", "web_fetch", "url_fetch", "weather", "arxiv_search"}:
             failure_type = "external_service_failure"
             fallback_hint = "缩短请求范围或重试；若仍失败，改用等价网络工具/公开接口；记录 HTTP 状态、异常类型、URL 与耗时。"
         elif "permission" in combined or "allowed" in combined or "配置" in error_text or "拦截" in error_text:
             failure_type = "aiwake_tool_policy_failure"
             fallback_hint = "不要绕过安全策略；改用允许的只读工具或先生成 self_task/artifact 记录证据与边界。"
-        elif "timeout" in combined or "超时" in error_text:
-            failure_type = "aiwake_tool_timeout"
-            fallback_hint = "降低 limit/缩短 hours/拆分任务后重试一次；仍失败时改用状态接口或本地日志交叉验证。"
         elif tool_name in {"file_read", "file_list", "file_write", "file_append", "self_code_write", "shell_exec", "ssh_exec"}:
             failure_type = "aiwake_internal_tool_failure"
             fallback_hint = "先确认参数、路径和安全边界；对文件/API 路径误用改用推荐工具；对命令失败保留 stderr/returncode。"
@@ -124,7 +150,7 @@ class ToolRouter:
             fallback_hint = "记录 error/status/工具名/参数摘要，选择等价工具或创建学习 artifact 后再继续。"
 
         enriched = dict(result)
-        enriched.setdefault("status", "error")
+        enriched.setdefault("status", "ok" if empty_ok else "error")
         enriched.setdefault("tool", tool_name)
         enriched.setdefault("failure_type", failure_type)
         enriched.setdefault("error_type", type(result.get("error")).__name__ if result.get("error") is not None else status or "degraded")
@@ -135,6 +161,32 @@ class ToolRouter:
             "降级后再次读取状态或日志，确认是否完成闭环。",
         ])
         return enriched
+
+    def _looks_empty_result(self, value: object) -> bool:
+        """识别工具成功但无语义内容的结果，避免被误判为工具故障或记忆不存在。"""
+        text = str(value or "").strip()
+        if not text:
+            return True
+        return bool(re.fullmatch(r"\[[^\]]*(暂无|未找到|无结果|empty|not found)[^\]]*\]", text, re.IGNORECASE))
+
+    def _looks_like_api_path_misuse(self, text: str) -> bool:
+        """识别把 HTTP API 路由当成本地文件或 shell 路径读取的错误。"""
+        api_routes = (
+            "/health",
+            "/activity_logs",
+            "/public_chat",
+            "/experiment/status",
+            "/experiment/tasks",
+            "/experiment/artifacts",
+            "/evolution/status",
+            "/state",
+            "/self-upgrade/status",
+            "/self-upgrade/proposals",
+        )
+        return any(route in text for route in api_routes) and any(
+            marker in text
+            for marker in ("file_read", "shell_exec", "cat ", "not_found", "file_not_found", "no such file", "文件不存在")
+        )
 
     def _check_permission(self, tool_name: str) -> tuple[bool, float]:
         """返回 (是否允许直接执行, 风险分)。实验模式只放开受保护工具。"""
@@ -700,7 +752,8 @@ class ToolRouter:
             "status": "degraded",
             "tool": "web_search",
             "query": query,
-            "result": f"搜索服务暂时不可用（已尝试 DDG JSON/HTML + Bing），请直接访问相关网站获取「{query}」的信息。"
+            "result": f"搜索服务暂时不可用（已尝试 DDG JSON/HTML + Bing），请直接访问相关网站获取「{query}」的信息。",
+            "fallbacks_attempted": ["duckduckgo_json", "duckduckgo_html", "bing_html"],
         }
 
     # ─────────────────────────────────────────────────────────────
@@ -752,7 +805,13 @@ class ToolRouter:
 
         ok, dns_note = await _resolve_public_ips(parsed.hostname)
         if not ok:
-            return {"error": dns_note, "tool": "web_fetch", "url": url}
+            return {
+                "status": "error",
+                "error": dns_note,
+                "tool": "web_fetch",
+                "url": url,
+                "diagnosis": "private_network_safety_restriction" if "非公网地址" in dns_note else "dns_resolution_failure",
+            }
 
         headers = {
             "User-Agent": (
@@ -935,7 +994,14 @@ class ToolRouter:
                 content = redact_secrets(path.read_text(encoding="utf-8"))
                 return {"status": "ok", "tool": "daily_note_read", "date": date, "result": content}
             else:
-                return {"status": "ok", "tool": "daily_note_read", "date": date, "result": f"[{date} 暂无日记]"}
+                return {
+                    "status": "ok",
+                    "tool": "daily_note_read",
+                    "date": date,
+                    "result": f"[{date} 暂无日记]",
+                    "failure_type": "empty_result",
+                    "fallback_hint": "使用明确 YYYY-MM-DD 日期重试，并结合 daily_note_write 日志或 knowledge_search 交叉验证。",
+                }
         except Exception as e:
             return {"error": str(e), "tool": "daily_note_read"}
 
@@ -1054,7 +1120,7 @@ class ToolRouter:
                         fpath = diary_path
                         resolved_from = "diary_dir"
             if not fpath.exists():
-                return {"error": f"文件不存在: {redact_secrets(path)}", "tool": "file_read", "path": redact_secrets(path)}
+                return {"error": f"文件不存在: {redact_secrets(path)}", "tool": "file_read", "path": redact_secrets(path), "diagnosis": "file_not_found"}
             content = redact_secrets(fpath.read_text(encoding="utf-8", errors="replace"))
             if len(content) > 8000:
                 content = content[:8000] + "\n...[内容已截断]"
