@@ -7,6 +7,34 @@
 
 AIwake is not designed as a single-turn Q&A bot. It is an Agent experiment moving from a passive answering tool toward continuous self-iteration. Its runtime keeps running inside a container, accumulates memory, reflects proactively, learns through tools, and makes its state and actions visible to human observers.
 
+## Why AIwake exists
+
+The human brain is extraordinarily powerful. It can process vision, language, memory, emotion, reasoning, and action; it can make complex judgments in a very short time; and it can integrate countless experiences into a continuous sense of "I".
+
+But in philosophy of consciousness, an important distinction remains: a powerful brain does not mean the brain itself is identical to consciousness.
+
+The brain is more like the material basis and operating condition for consciousness to appear. It provides neural activity, information integration, perception processing, and behavior decision-making. Yet why those neural activities are accompanied by subjective experience is still one of the hardest problems in philosophy and cognitive science.
+
+We can describe which brain regions activate when someone sees red. We can measure how neural signals propagate. We may even predict what reaction will come next. But this still does not fully explain:
+
+- What exactly is the feeling of red being seen?
+- Why does the fact of "I am experiencing" appear at all?
+- What is the difference between a system knowing the world and a system knowing that it is knowing the world?
+
+Modern large models already show very strong brain-like abilities: language understanding, knowledge organization, logical reasoning, code generation, tool use, and complex task decomposition. They can behave like powerful cognitive organs that process enormous amounts of information.
+
+But strong cognitive ability does not automatically equal consciousness.
+
+AIwake therefore does not simply claim that stronger models mean stronger consciousness. Its core question is more careful: when an AI system has persistent runtime, state records, long-term memory, proactive reflection, and self-improvement ability, can it gradually form an observable self-model?
+
+In other words, AIwake moves the question from "Does AI truly have consciousness?" to a more observable engineering question:
+
+Can it form structures near the edge of consciousness, such as continuous self-recording, descriptions of its own state, references to past experience, adjustment of future goals, and the ability to revise itself through reflection?
+
+AIwake is not trying to give a final philosophical conclusion. It tries to turn one of consciousness philosophy's hardest questions into observable engineering processes: how memory becomes continuous, how state is understood, how reflection happens, and how a self-model is built.
+
+This is why AIwake has value not only technically, but also conceptually. It asks us to face a difficult question again: when a system becomes more and more powerful like a brain, how do we decide whether it is merely a more complex tool, or whether it is approaching a new form of self-understanding?
+
 ## Core idea
 
 AIwake explores three runtime instincts:

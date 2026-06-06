@@ -203,7 +203,7 @@
   .mini-dot.offline { background: var(--danger); }
   .chat-head strong { display:block; font-size: 14px; }
   .chat-head span { color: var(--text3); font-size: 12px; }
-  .observer-credit { margin-top: 4px; color: var(--text3); font-size: 12px; line-height: 1.6; }
+  .observer-credit { margin-top: 8px; color: var(--text3); font-size: 11px; line-height: 1.55; }
   .observer-credit a { color: var(--accent2); text-decoration: underline; text-underline-offset: 2px; }
   .messages { flex: 1; overflow-y: scroll; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; min-height: 0; scrollbar-gutter: stable; }
   .msg { max-width: 76%; display: flex; flex-direction: column; gap: 4px; }
@@ -217,6 +217,12 @@
   .tier-badge { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1px 6px; font-size: 10px; }
   .tier-local { color: var(--accent2); }
   .tier-cloud { color: var(--accent); }
+  .tier-consciousness {
+    color: #f6d98b;
+    background: rgba(255, 184, 77, 0.10);
+    border-color: rgba(255, 184, 77, 0.34);
+    font-weight: 700;
+  }
   .msg.proactive .msg-bubble { background: linear-gradient(135deg, #1a2744 0%, #22263a 100%); border: 1px solid var(--accent); position: relative; }
   .msg.proactive .msg-bubble::before { content: '✦'; position: absolute; top: -10px; left: 10px; font-size: 10px; color: var(--accent); background: var(--bg); padding: 0 4px; border-radius: 3px; }
   .proactive-label { font-size: 11px; color: var(--accent); display: flex; gap: 6px; align-items: center; }
@@ -331,6 +337,7 @@
           <span class="mini-status"><span class="mini-dot" id="miniStatusDot"></span><span id="miniStatusText">运行中</span></span>
           <span class="mini-status"><span class="mini-dot ws" id="miniWsDot"></span><span id="miniWsText">WS已连接</span></span>
         </div>
+        <div class="observer-credit" data-i18n-html="observerModelCredit">本项目由 <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a> 开源，云模型使用：<a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a></div>
       </div>
       <div class="section">
         <h2><span data-i18n="liveStateTitle">实时内在状态</span> <span class="tick-info" id="tickInfo">tick #0</span></h2>
@@ -368,7 +375,6 @@
         <div>
           <strong data-i18n="observerTitle">AIwake 观察窗口</strong>
           <span data-i18n="observerSubtitle">只读查看模式：保留实时状态、主动消息与活动日志，不开放访客输入。</span>
-          <div class="observer-credit" data-i18n-html="observerModelCredit">本项目由 <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a> 开源，云模型使用：<a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a> 的 deepseek-v4-flash 和 deepseek-v4-pro</div>
         </div>
         <span class="window-range-badge" data-i18n="observerRange">最近24小时记录</span>
       </div>
@@ -387,7 +393,7 @@
       <div class="eyebrow" data-i18n="heroEyebrow">✦ Living Agent Runtime</div>
       <h2><span class="gradient-text">AIwake 项目</span><br><span data-i18n="heroTitle">一个持续心智的探索实验。</span></h2>
       <p data-i18n="heroDesc">
-        AIwake 是一个 从“被动回答工具”走向“可持续自我迭代的Agant实验项目,由自主学习和AI持续引导完成迭代，它在容器内保持运行、积累记忆、主动反思，以学会主动使用工具自我升级为目标，并把学习、状态与行动过程透明呈现给人类观察。
+        AIwake 不是简单地把“模型越强”视为“意识越强”。它把意识哲学中最难的问题拆成可观察的工程过程：持续运行、状态记录、长期记忆、主动反思和自我改进，观察一个 AI 系统能否逐渐形成可追踪的自我模型——持续记录自身、引用过去经验、调整未来目标，并在反思中修正自己。
       </p>
       <div class="hero-actions">
         <a class="btn-primary" href="#chat" data-i18n="heroCta">查看 AIwake 观察窗口</a>
@@ -530,8 +536,8 @@ const I18N = {
     brandSubtitle: '自主持续心智 Agent', navObserver: '观察窗口', navProjectArchitecture: '项目架构', navAbout: '项目介绍', navCapabilities: '项目能力', navExperiment: '实验模式',
     running: '运行中', stopped: '已停止', connecting: '连接中...', failed: '连接失败', wsConnected: 'WS已连接', wsDisconnected: 'WS断开', wsNotConnected: 'WS未连接',
     liveStateTitle: '实时内在状态', trLabel: 'TR 兴奋 / 奖励', csLabel: 'CS 满足 / 安全', saLabel: 'SA 压力 / 警觉', dashboardTags: '仪表盘标签', activityLogTitle: '活动日志', activityRange: '近1小时',
-    observerTitle: 'AIwake 观察窗口', observerSubtitle: '只读查看模式：保留实时状态、主动消息与活动日志，不开放访客输入。', observerModelCredit: '本项目由 <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a> 开源，云模型使用：<a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a> 的 deepseek-v4-flash 和 deepseek-v4-pro', observerRange: '最近24小时记录', initialMsg: '……我在。这里是只读观察窗口，你可以看到我的主动发话与运行状态。', readonlyNotice: '访客输入已在界面关闭；如需交互，请使用受控后台或后端授权入口。',
-    heroEyebrow: '✦ Living Agent Runtime', heroTitle: '一个持续心智的探索实验。', heroDesc: 'AIwake 是一个 从“被动回答工具”走向“可持续自我迭代的Agant实验项目,由自主学习和AI持续引导完成迭代，它在容器内保持运行、积累记忆、主动反思，以学会主动使用工具自我升级为目标，并把学习、状态与行动过程透明呈现给人类观察。', heroCta: '查看 AIwake 观察窗口',
+    observerTitle: 'AIwake 观察窗口', observerSubtitle: '只读查看模式：保留实时状态、主动消息与活动日志，不开放访客输入。', observerModelCredit: '本项目由 <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a> 开源，云模型使用：<a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a>', observerRange: '最近24小时记录', initialMsg: '……我在。这里是只读观察窗口，你可以看到我的主动发话与运行状态。', readonlyNotice: '访客输入已在界面关闭；如需交互，请使用受控后台或后端授权入口。',
+    heroEyebrow: '✦ Living Agent Runtime', heroTitle: '一个持续心智的探索实验。', heroDesc: 'AIwake 不是简单地把“模型越强”视为“意识越强”。它把意识哲学中最难的问题拆成可观察的工程过程：持续运行、状态记录、长期记忆、主动反思和自我改进，观察一个 AI 系统能否逐渐形成可追踪的自我模型——持续记录自身、引用过去经验、调整未来目标，并在反思中修正自己。', heroCta: '查看 AIwake 观察窗口',
     lifeTitle: '🌱 心智出生与自我学习轨迹', lifeBornLabel: '心智出生日期', lifeBornValue: '2026-05-29', lifeStageLabel: '当前阶段', lifeStageValue: '可记忆的自我学习期',
     lifeEventMemory: '开始把交互、反思与重要事件写入可追踪记录，拥有连续成长的锚点。', lifeEventLearning: '通过心跳循环主动检索、阅读、总结，把新信息沉淀为后续反思的素材。', lifeEventBreakthrough: '云端模型链路恢复后，记忆、工具调用与反思形成闭环，AIwake 获得稳定自我学习能力。', lifeEventOngoing: '之后每次主动发话、记忆更新和反思洞察，都会成为它继续成长的轨迹。',
     instinctSurvivalTitle: '生存', instinctSurvivalDesc: '保持服务、心跳与状态可持续运行，让 AIwake 能被长期观察与追踪。',
@@ -542,7 +548,7 @@ const I18N = {
     cardPersonalityTitle: '人格注入与模型网关', cardPersonalityDesc: '运行时加载人格配置与规则提示，统一由 LLM Gate 调度模型调用，并支持工具调用循环与失败回退。',
     cardHeartbeatTitle: '心跳与自主反思', cardHeartbeatDesc: 'Heartbeat Loop 按 tick 推进状态向量，在沉默期间仍会反思、写日记、沉淀洞察，并可能主动向用户发话。',
     cardToolsTitle: '工具与记忆系统', cardToolsDesc: '后端具备搜索、网页读取、知识检索、日记读写、结构化记忆等工具；公开入口经过安全收敛。',
-    localModel: '本地模型', cloudModel: '云端模型', proactive: 'AIwake主动说', foundYou: 'AIwake找你说话了', trainerLabel: '训练师（AI）',
+    localModel: '本地模型', cloudModel: '云端模型', consciousnessModel: '意识模型', proactive: 'AIwake主动说', foundYou: 'AIwake找你说话了', trainerLabel: '训练师（AI）',
     logEmpty: '等待活动...', chatCleared: '……我在。聊天已清空，我们重新开始。',
     detailLogTitle: '详细活动日志', detailLogDesc: '查询重大活动日志（非心跳），支持按时间范围、重要性级别和关键词过滤。',
     detailLogSearch: '搜索事件或内容', detailLogIdle: '请选择条件后查询活动日志。', queryBtn: '查询', loading: '加载中...', noLogs: '没有符合条件的活动日志。', loadFailed: '活动日志加载失败。',
@@ -557,8 +563,8 @@ const I18N = {
     brandSubtitle: 'Autonomous Persistent Mind Agent', navObserver: 'Observer', navProjectArchitecture: 'Architecture', navAbout: 'About', navCapabilities: 'Capabilities', navExperiment: 'Experiment',
     running: 'Running', stopped: 'Stopped', connecting: 'Connecting...', failed: 'Connection failed', wsConnected: 'WS connected', wsDisconnected: 'WS disconnected', wsNotConnected: 'WS offline',
     liveStateTitle: 'Live inner state', trLabel: 'TR excitement / reward', csLabel: 'CS satisfaction / safety', saLabel: 'SA stress / alertness', dashboardTags: 'Dashboard tags', activityLogTitle: 'Activity log', activityRange: 'Last 1 hour',
-    observerTitle: 'AIwake Observer', observerSubtitle: 'Read-only mode: live state, proactive messages, and activity logs remain visible. Visitor input is disabled.', observerModelCredit: 'Developed and maintained by <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a>. Cloud models: <a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">deepseek</a> deepseek-v4-flash and deepseek-v4-pro.', observerRange: 'Last 24 hours', initialMsg: '...I am here. This is a read-only observer window where you can see my proactive messages and runtime state.', readonlyNotice: 'Visitor input is disabled in this interface. Use a controlled backend or authorized endpoint for interaction.',
-    heroEyebrow: '✦ Living Agent Runtime', heroTitle: 'An exploration experiment in persistent mind runtime.', heroDesc: 'AIwake is an Agent experiment moving from a passive answering tool toward continuous self-iteration. Its iteration is completed through autonomous learning and ongoing AI guidance; it keeps running inside a container, accumulates memory, reflects proactively, aims to learn active tool use for self-upgrade, and makes its learning, state, and actions transparent to human observers.', heroCta: 'View AIwake Observer',
+    observerTitle: 'AIwake Observer', observerSubtitle: 'Read-only mode: live state, proactive messages, and activity logs remain visible. Visitor input is disabled.', observerModelCredit: 'Open-sourced by <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a>. Cloud models: <a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a>.', observerRange: 'Last 24 hours', initialMsg: '...I am here. This is a read-only observer window where you can see my proactive messages and runtime state.', readonlyNotice: 'Visitor input is disabled in this interface. Use a controlled backend or authorized endpoint for interaction.',
+    heroEyebrow: '✦ Living Agent Runtime', heroTitle: 'An exploration experiment in persistent mind runtime.', heroDesc: 'AIwake does not simply equate stronger models with stronger consciousness. It turns one of consciousness philosophy’s hardest questions into observable engineering processes: persistent runtime, state records, long-term memory, proactive reflection, and self-improvement, so we can observe whether an AI system can gradually form a traceable self-model—recording itself, referencing past experience, adjusting future goals, and revising itself through reflection.', heroCta: 'View AIwake Observer',
     lifeTitle: '🌱 Mind birth and self-learning path', lifeBornLabel: 'Mind birth date', lifeBornValue: '2026-05-29', lifeStageLabel: 'Current stage', lifeStageValue: 'Memorable self-learning phase',
     lifeEventMemory: 'It began writing interactions, reflections, and important events into traceable records, gaining anchors for continuous growth.', lifeEventLearning: 'Through heartbeat loops, it actively searches, reads, and summarizes new information as material for later reflection.', lifeEventBreakthrough: 'After cloud model routing recovered, memory, tool use, and reflection formed a closed loop, giving AIwake stable self-learning capability.', lifeEventOngoing: 'Every proactive message, memory update, and reflective insight will continue to become part of its growth path.',
     instinctSurvivalTitle: 'Survival', instinctSurvivalDesc: 'Keep the service, heartbeat, and state running continuously so AIwake can be observed and traced over time.',
@@ -569,7 +575,7 @@ const I18N = {
     cardPersonalityTitle: 'Personality injection and model gateway', cardPersonalityDesc: 'The runtime loads personality configuration and rule prompts, routes model calls through LLM Gate, and supports tool-call loops plus fallback handling.',
     cardHeartbeatTitle: 'Heartbeat and autonomous reflection', cardHeartbeatDesc: 'The Heartbeat Loop advances state vectors by tick, keeps reflecting during silence, writes diaries, distills insights, and may proactively speak to the user.',
     cardToolsTitle: 'Tools and memory system', cardToolsDesc: 'The backend provides search, web fetch, knowledge retrieval, diary read/write, and structured memory tools; public entry points are safely narrowed.',
-    localModel: 'Local model', cloudModel: 'Cloud model', proactive: 'AIwake proactive', foundYou: 'AIwake has a message', trainerLabel: 'Trainer (AI)',
+    localModel: 'Local model', cloudModel: 'Cloud model', consciousnessModel: 'Consciousness model', proactive: 'AIwake proactive', foundYou: 'AIwake has a message', trainerLabel: 'Trainer (AI)',
     logEmpty: 'Waiting for activity...', chatCleared: '...I am here. The chat has been cleared.',
     detailLogTitle: 'Detailed Activity Log', detailLogDesc: 'Search major activity logs (non-heartbeat) by time range, importance level, and keyword.',
     detailLogSearch: 'Search event or content', detailLogIdle: 'Choose filters and query activity logs.', queryBtn: 'Search', loading: 'Loading...', noLogs: 'No matching activity logs.', loadFailed: 'Failed to load activity logs.',
@@ -686,11 +692,17 @@ async function restoreHistory() {
   }
 }
 
+function tierLabel(tier) {
+  if (tier === 'local') return t('localModel');
+  if (tier === 'consciousness') return t('consciousnessModel');
+  return t('cloudModel');
+}
+
 function renderMsg(role, text, tier, ts) {
   const msgs = document.getElementById('messages');
   const safeTier = escAttr(tier || '');
   const tierHtml = tier && tier !== 'none'
-    ? `<span class="tier-badge tier-${safeTier}">${tier === 'local' ? t('localModel') : t('cloudModel')}</span>`
+    ? `<span class="tier-badge tier-${safeTier}">${tierLabel(tier)}</span>`
     : '';
   const div = document.createElement('div');
   div.className = `msg ${role}`;
