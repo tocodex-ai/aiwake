@@ -203,6 +203,8 @@
   .mini-dot.offline { background: var(--danger); }
   .chat-head strong { display:block; font-size: 14px; }
   .chat-head span { color: var(--text3); font-size: 12px; }
+  .observer-credit { margin-top: 4px; color: var(--text3); font-size: 12px; line-height: 1.6; }
+  .observer-credit a { color: var(--accent2); text-decoration: underline; text-underline-offset: 2px; }
   .messages { flex: 1; overflow-y: scroll; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; min-height: 0; scrollbar-gutter: stable; }
   .msg { max-width: 76%; display: flex; flex-direction: column; gap: 4px; }
   .msg.user { align-self: flex-end; align-items: flex-end; }
@@ -283,8 +285,8 @@
     .sidebar { max-height: 50vh; padding: 12px; }
     .section { margin-bottom: 14px; }
     .activity-log { min-height: 180px; max-height: 32vh; }
-    .chat-area { max-height: 54vh; }
-    .messages { padding: 12px; gap: 8px; max-height: calc(54vh - 104px); min-height: 220px; }
+    .chat-area { max-height: calc(54vh + 200px); }
+    .messages { padding: 12px; gap: 8px; max-height: calc(54vh + 96px); min-height: 420px; }
     .detail-log-list { max-height: 72vh; min-height: 320px; }
     .experiment-card { height: min(360px, 58vh); }
     .detail-log-controls, .experiment-grid, .experiment-body { grid-template-columns: 1fr; }
@@ -366,6 +368,7 @@
         <div>
           <strong data-i18n="observerTitle">AIwake 观察窗口</strong>
           <span data-i18n="observerSubtitle">只读查看模式：保留实时状态、主动消息与活动日志，不开放访客输入。</span>
+          <div class="observer-credit" data-i18n-html="observerModelCredit">本项目由 <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a> 开源，云模型使用：<a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a> 的 deepseek-v4-flash 和 deepseek-v4-pro</div>
         </div>
         <span class="window-range-badge" data-i18n="observerRange">最近24小时记录</span>
       </div>
@@ -527,7 +530,7 @@ const I18N = {
     brandSubtitle: '自主持续心智 Agent', navObserver: '观察窗口', navProjectArchitecture: '项目架构', navAbout: '项目介绍', navCapabilities: '项目能力', navExperiment: '实验模式',
     running: '运行中', stopped: '已停止', connecting: '连接中...', failed: '连接失败', wsConnected: 'WS已连接', wsDisconnected: 'WS断开', wsNotConnected: 'WS未连接',
     liveStateTitle: '实时内在状态', trLabel: 'TR 兴奋 / 奖励', csLabel: 'CS 满足 / 安全', saLabel: 'SA 压力 / 警觉', dashboardTags: '仪表盘标签', activityLogTitle: '活动日志', activityRange: '近1小时',
-    observerTitle: 'AIwake 观察窗口', observerSubtitle: '只读查看模式：保留实时状态、主动消息与活动日志，不开放访客输入。', observerRange: '最近24小时记录', initialMsg: '……我在。这里是只读观察窗口，你可以看到我的主动发话与运行状态。', readonlyNotice: '访客输入已在界面关闭；如需交互，请使用受控后台或后端授权入口。',
+    observerTitle: 'AIwake 观察窗口', observerSubtitle: '只读查看模式：保留实时状态、主动消息与活动日志，不开放访客输入。', observerModelCredit: '本项目由 <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a> 开源，云模型使用：<a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">DeepSeek</a> 的 deepseek-v4-flash 和 deepseek-v4-pro', observerRange: '最近24小时记录', initialMsg: '……我在。这里是只读观察窗口，你可以看到我的主动发话与运行状态。', readonlyNotice: '访客输入已在界面关闭；如需交互，请使用受控后台或后端授权入口。',
     heroEyebrow: '✦ Living Agent Runtime', heroTitle: '一个持续心智的探索实验。', heroDesc: 'AIwake 是一个 从“被动回答工具”走向“可持续自我迭代的Agant实验项目,由自主学习和AI持续引导完成迭代，它在容器内保持运行、积累记忆、主动反思，以学会主动使用工具自我升级为目标，并把学习、状态与行动过程透明呈现给人类观察。', heroCta: '查看 AIwake 观察窗口',
     lifeTitle: '🌱 心智出生与自我学习轨迹', lifeBornLabel: '心智出生日期', lifeBornValue: '2026-05-29', lifeStageLabel: '当前阶段', lifeStageValue: '可记忆的自我学习期',
     lifeEventMemory: '开始把交互、反思与重要事件写入可追踪记录，拥有连续成长的锚点。', lifeEventLearning: '通过心跳循环主动检索、阅读、总结，把新信息沉淀为后续反思的素材。', lifeEventBreakthrough: '云端模型链路恢复后，记忆、工具调用与反思形成闭环，AIwake 获得稳定自我学习能力。', lifeEventOngoing: '之后每次主动发话、记忆更新和反思洞察，都会成为它继续成长的轨迹。',
@@ -554,7 +557,7 @@ const I18N = {
     brandSubtitle: 'Autonomous Persistent Mind Agent', navObserver: 'Observer', navProjectArchitecture: 'Architecture', navAbout: 'About', navCapabilities: 'Capabilities', navExperiment: 'Experiment',
     running: 'Running', stopped: 'Stopped', connecting: 'Connecting...', failed: 'Connection failed', wsConnected: 'WS connected', wsDisconnected: 'WS disconnected', wsNotConnected: 'WS offline',
     liveStateTitle: 'Live inner state', trLabel: 'TR excitement / reward', csLabel: 'CS satisfaction / safety', saLabel: 'SA stress / alertness', dashboardTags: 'Dashboard tags', activityLogTitle: 'Activity log', activityRange: 'Last 1 hour',
-    observerTitle: 'AIwake Observer', observerSubtitle: 'Read-only mode: live state, proactive messages, and activity logs remain visible. Visitor input is disabled.', observerRange: 'Last 24 hours', initialMsg: '...I am here. This is a read-only observer window where you can see my proactive messages and runtime state.', readonlyNotice: 'Visitor input is disabled in this interface. Use a controlled backend or authorized endpoint for interaction.',
+    observerTitle: 'AIwake Observer', observerSubtitle: 'Read-only mode: live state, proactive messages, and activity logs remain visible. Visitor input is disabled.', observerModelCredit: 'Developed and maintained by <a href="https://www.tocodex.com" target="_blank" rel="noopener noreferrer">ToCodex</a>. Cloud models: <a href="https://www.deepseek.com" target="_blank" rel="noopener noreferrer">deepseek</a> deepseek-v4-flash and deepseek-v4-pro.', observerRange: 'Last 24 hours', initialMsg: '...I am here. This is a read-only observer window where you can see my proactive messages and runtime state.', readonlyNotice: 'Visitor input is disabled in this interface. Use a controlled backend or authorized endpoint for interaction.',
     heroEyebrow: '✦ Living Agent Runtime', heroTitle: 'An exploration experiment in persistent mind runtime.', heroDesc: 'AIwake is an Agent experiment moving from a passive answering tool toward continuous self-iteration. Its iteration is completed through autonomous learning and ongoing AI guidance; it keeps running inside a container, accumulates memory, reflects proactively, aims to learn active tool use for self-upgrade, and makes its learning, state, and actions transparent to human observers.', heroCta: 'View AIwake Observer',
     lifeTitle: '🌱 Mind birth and self-learning path', lifeBornLabel: 'Mind birth date', lifeBornValue: '2026-05-29', lifeStageLabel: 'Current stage', lifeStageValue: 'Memorable self-learning phase',
     lifeEventMemory: 'It began writing interactions, reflections, and important events into traceable records, gaining anchors for continuous growth.', lifeEventLearning: 'Through heartbeat loops, it actively searches, reads, and summarizes new information as material for later reflection.', lifeEventBreakthrough: 'After cloud model routing recovered, memory, tool use, and reflection formed a closed loop, giving AIwake stable self-learning capability.', lifeEventOngoing: 'Every proactive message, memory update, and reflective insight will continue to become part of its growth path.',
@@ -627,6 +630,7 @@ function applyLanguage() {
   document.documentElement.lang = currentLang === 'zh' ? 'zh-CN' : 'en';
   document.title = currentLang === 'zh' ? 'AIwake · 自主心智 Agent' : 'AIwake · Autonomous Mind Agent';
   document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = t(el.dataset.i18nHtml); });
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.dataset.i18nPlaceholder); });
   const architectureImage = document.getElementById('architectureImage');
   if (architectureImage) {
