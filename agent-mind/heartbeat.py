@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Optional
 from state import InternalState
 from llm_gate import LLMGate, LLMTier
-from public_chat import append_public_chat
+from collections import deque
+from public_chat import append_public_chat, read_public_chat_history
 from user_memory import (
     touch_profile, build_user_context, update_impression,
     write_diary_entry, extract_meta_from_reply,
@@ -21,6 +22,7 @@ from user_memory import (
 )
 from experiment_store import get_experiment_store
 from safety_guard import redact_secrets
+from evolution.growth_tracker import record_growth_milestone
 
 # 两次主动发话之间的最短冷却（秒）
 PROACTIVE_COOLDOWN = float(os.getenv("PROACTIVE_COOLDOWN_SECONDS", "300"))
@@ -33,6 +35,8 @@ TICK_INTERVAL = float(os.getenv("TICK_INTERVAL_SECONDS", "15"))   # 心跳间隔
 REFLECT_INTERVAL = int(os.getenv("REFLECT_EVERY_N_TICKS", "4"))  # 每N次tick做一次深度反思（默认4=1分钟，按15秒tick计算）
 REFLECT_MAX_ROUNDS = int(os.getenv("REFLECT_MAX_ROUNDS", "2"))  # 自主反思最多工具循环轮数，避免高频反思爆调用量
 COMPRESS_EVERY_N_TICKS = int(os.getenv("COMPRESS_EVERY_N_TICKS", "100"))  # 每N次tick用本地模型压缩旧日记（默认100≈25分钟）
+REFLECT_TOOL_SELF_CHECK_WINDOW_MINUTES = int(os.getenv("REFLECT_TOOL_SELF_CHECK_WINDOW_MINUTES", "30"))
+# 连续多少轮反思没有工具调用后，强制执行一次最小工具调用（默认5≈5分钟）
 
 
 @dataclass
@@ -62,7 +66,10 @@ class EventBus:
             return None
 
     def push_sync(self, event: Event):
-        self._queue.put_nowait(event)
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("[EventBus] 队列已满，丢弃事件: type=%s priority=%d", event.type, event.priority)
 
 
 # 全局事件总线（供 API 层注入事件）
@@ -86,6 +93,46 @@ async def _save_insight_async(title: str, body: str) -> None:
         logger.warning(f"[Heartbeat] 洞察保存失败: {e}")
 
 
+# ── 主动发话去重：最近 N 条消息的归一化文本缓存 ──
+PROACTIVE_DEDUP_WINDOW = 20  # 保留最近 20 条主动发话用于去重
+PROACTIVE_DEDUP_MIN_LEN = 6  # 短于此长度的消息不参与去重（如"嗯"）
+
+
+def _normalize_speak(text: str) -> str:
+    """归一化主动发话内容，用于去重比较：去掉标点、空白、省略号等"""
+    import re as _re
+    t = _re.sub(r'[。，、！？…\s\.\,\!\?\;\:\'\"\-\—\─\~\n\r]+', '', text)
+    return t.strip().lower()
+
+
+def _summarize_reflection_for_display(text: str, *, max_chars: int = 120) -> str:
+    """提取反思中的实质内容（内在独白/辩证整合等）用于展示与持久化摘要。
+
+    第零步的工具结果自检与三步早退门控是每轮固定模板，会让对外可观察的
+    reflection_content 持续重复同一句话，看起来像"空转"。这里在不改变反思
+    全文（仍完整写入日记 / experiment_store 供审计）的前提下，仅为可观察摘要
+    剔除这些固定模板段落，让外部观察到的反思内容反映真实思考的变化。
+    """
+    import re as _re
+    if not text:
+        return ""
+    cleaned = text
+    # 1) 去掉"本轮心跳自检：……需要分类？……"模板（含其后引用的证据时间戳）
+    cleaned = _re.sub(r"本轮(?:心跳)?自检[:：].*?需要分类[?？][^\n]*", "", cleaned, flags=_re.S)
+    # 2) 去掉"[gate_check] 三步早退门控……"模板行
+    cleaned = _re.sub(r"\[?gate_check\]?\s*三步早退门控[^\n]*", "", cleaned, flags=_re.S)
+    # 3) 去掉零异常 / 第零步等固定结构标记行
+    cleaned = _re.sub(r"(?m)^\s*(?:第零步[AB]?|本轮零异常)[^\n]*$", "", cleaned)
+    # 4) 去掉步骤小标题，保留其后的真实内容
+    cleaned = _re.sub(r"(?:\*\*)?第[一二三]步[^\n：:]*[：:]?(?:\*\*)?", "", cleaned)
+    # 折叠空白并清理首尾标点
+    cleaned = _re.sub(r"\s+", " ", cleaned).strip(" ：:，,。.-—\n\t")
+    if len(cleaned) < 12:
+        # 实质内容过短，退回原文，确保不丢信息
+        cleaned = _re.sub(r"\s+", " ", text).strip()
+    return cleaned[:max_chars]
+
+
 class HeartbeatLoop:
     def __init__(self, personality_prompt: str = ""):
         self.state = InternalState.load()
@@ -95,8 +142,12 @@ class HeartbeatLoop:
         self._tick = 0
         self._last_user_time: float = time.time()      # 最后一次收到用户消息的时间
         self._last_proactive_time: float = 0.0         # 最后一次主动发话的时间
+        self._consecutive_no_tool_reflects: int = 0    # 连续无工具调用的反思轮数
         # WebSocket 广播器（由 main.py 注入）
         self._ws_broadcast = None
+        # ── 主动发话去重缓存（跨容器重启从 public_chat 历史加载） ──
+        self._proactive_dedup_cache: deque = deque(maxlen=PROACTIVE_DEDUP_WINDOW)
+        self._proactive_dedup_loaded = False
 
     def stop(self):
         self._running = False
@@ -148,6 +199,57 @@ class HeartbeatLoop:
             except Exception:
                 pass
 
+    def _recent_tool_activity_summary(self, *, minutes: int = REFLECT_TOOL_SELF_CHECK_WINDOW_MINUTES) -> str:
+        """读取最近工具活动，给自主反思提供确定性时间窗证据，避免只看上一轮导致 repetition_drift。"""
+        window_minutes = max(1, min(int(minutes or 30), 240))
+        cutoff = time.time() - window_minutes * 60
+        log_dir = Path(os.getenv("DIARY_DIR", "/app/data/diary"))
+        now = _dt.datetime.now()
+        candidates = [log_dir / f"activity_{now.date().isoformat()}.log"]
+        yesterday = (now - _dt.timedelta(days=1)).date().isoformat()
+        candidates.append(log_dir / f"activity_{yesterday}.log")
+        items: list[dict] = []
+        for log_file in candidates:
+            if not log_file.exists():
+                continue
+            try:
+                lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-600:]
+            except Exception:
+                continue
+            date_text = log_file.stem.replace("activity_", "")
+            for line in lines:
+                if "[tool_call]" not in line and "[tool_result]" not in line:
+                    continue
+                try:
+                    hms = line[1:9]
+                    event = line.split("] [", 1)[1].split("] ", 1)[0]
+                    content = line.split("] ", 2)[2]
+                    ts = _dt.datetime.strptime(f"{date_text} {hms}", "%Y-%m-%d %H:%M:%S").timestamp()
+                except Exception:
+                    continue
+                if ts >= cutoff:
+                    items.append({"ts": ts, "time": hms, "event": event, "content": content})
+        items = sorted(items, key=lambda x: x["ts"])[-12:]
+        if not items:
+            return f"过去 {window_minutes} 分钟内未在 activity 日志中发现 tool_call/tool_result。"
+
+        summary_lines = [f"过去 {window_minutes} 分钟工具活动窗口（必须优先于‘上轮以来’判断引用）："]
+        for item in items:
+            content = str(item["content"])[:180]
+            lower_content = content.lower()
+            classification = ""
+            if item["event"] == "tool_result":
+                failed = any(marker in lower_content for marker in ("error", "失败", "不可用", "timeout", "403", "429", "521"))
+                empty = content.rstrip().endswith("返回:") or content.rstrip().endswith("→")
+                if failed:
+                    classification = " | classification=failure"
+                elif empty:
+                    classification = " | classification=empty_result"
+                else:
+                    classification = " | classification=success"
+            summary_lines.append(f"- {item['time']} {item['event']}: {content}{classification}")
+        return "\n".join(summary_lines)
+
     async def run(self):
         self._running = True
         logger.info(f"[Heartbeat] 启动，间隔 {TICK_INTERVAL}s，每 {REFLECT_INTERVAL} 次 tick 深度反思")
@@ -198,7 +300,20 @@ class HeartbeatLoop:
                 {"tick": self._tick}
             )
 
-        # 5. 存状态
+        # 5.5 广播 state_update（让前端实时同步 tick 和状态向量）
+        if self._ws_broadcast:
+            await self._ws_broadcast({
+                "type": "state_update",
+                "tick": self.state.tick_count,
+                "TR": round(self.state.TR, 2),
+                "CS": round(self.state.CS, 2),
+                "SA": round(self.state.SA, 2),
+                "energy": self.state.energy_level,
+                "mood": self.state.mood_level,
+                "patience": self.state.patience_level,
+            })
+
+        # 6. 存状态
         self.state.save()
 
     async def _drain_events(self) -> list[Event]:
@@ -443,8 +558,7 @@ class HeartbeatLoop:
                     name=f"日记摘要 {date_label}",
                     description=f"自动压缩自 {diary_file.name}",
                     body=summary.strip(),
-                    memory_type="summary",
-                    keywords=[date_label, "日记", "摘要"],
+                    memory_type="insight",
                 )
 
                 # 不删除原日记文件：日记属于 AIwake 的长期记忆与审计证据。
@@ -496,7 +610,7 @@ class HeartbeatLoop:
                 "已为第一条自我学习任务生成可观察学习 artifact 草稿",
                 {"artifact_id": bootstrap_artifact.get("id"), "task_id": bootstrap_artifact.get("task_id")}
             )
- 
+
         # 构建反思提示词，告诉 LLM 它可以选择是否发起对话
         speak_hint = ""
         if has_ws and cooldown_ok and idle_secs > PROACTIVE_IDLE_SECONDS:
@@ -507,38 +621,46 @@ class HeartbeatLoop:
                 "如果没有，就不要写这一行。不要为了说话而说话。"
             )
 
+        recent_tool_activity = self._recent_tool_activity_summary()
+
+        # 连续多轮空转时，去掉"什么都不用"这一项与"不必为了调用而调用"的措辞，
+        # 让本轮提示不再与 system prompt 中的行动压力信号自相矛盾。
+        # 注意：这只是消除提示词内部的矛盾，仍由 LLM 自主决定调用哪个工具，
+        # 不强制指定工具、不加任何门控或工具使用限制。
+        if self._consecutive_no_tool_reflects >= 3:
+            idle_option_line = ""
+            tool_freedom_line = (
+                f"你已连续 {self._consecutive_no_tool_reflects} 轮反思只是在想、没有任何行动。"
+                f"这次请把其中一个想法真正落地为一次工具调用，让内省转化为可观察的进展；"
+                f"具体调用哪个工具仍完全由你自己判断。\n"
+            )
+        else:
+            idle_option_line = "- 也可以什么工具都不用，只是安静地想一想\n"
+            tool_freedom_line = (
+                "工具调用完全由你自己判断是否需要，不必为了调用而调用，也不必为了不调用而克制。\n"
+            )
+
         reflect_prompt = (
             f"当前内在状态：{', '.join(feeling_tags)}\n"
             f"距上次与用户交流已过去约 {int(idle_secs / 60)} 分钟。\n"
             f"当前目标：{self.state.active_goal}\n\n"
-            f"请进行一次自主内省与成长行动，必须先执行工具结果自检与证据门控，再决定是否探索：\n\n"
-            f"**第零步A——工具结果自检（必须写在反思第一段，且在任何工具调用之前）**：\n"
-            f"先写出 `本轮心跳自检：上轮以来是否有 tool_result 的 failure 或 empty_result 需要分类？`。\n"
-            f"- 若有 failure 或 empty_result，逐条记录 tool_name、fail_stage、error_type、retryable、fallback_path、evidence_endpoint。\n"
-            f"- error_type 只能从 timeout、network、permission、format、external_block/rate_limit、empty_result、unknown 中选择。\n"
-            f"- empty_result 表示接口正常但结果为空，不能自动判失败；必须交叉验证。external_block/rate_limit 必须优先换等价证据源。\n"
-            f"- 若无新增异常，必须明确写出 `本轮零异常`，不要用主题性反思替代自检。\n\n"
-            f"**第零步B——三步早退门控（必须写在工具结果自检之后、任何工具调用之前）**：\n"
-            f"继续写出 `[gate_check] 三步早退门控——本轮vs上轮证据差异：...`。\n"
-            f"- 若本轮与上一轮证据高度重复，禁止扩展搜索；只允许整理已有碎片、标记待验证项、记录缺口，必要时写日记。\n"
-            f"- 若确有新证据，调用工具前必须写明目标、预期证据、失败分类和降级路径。\n"
-            f"- 工具失败后只能记录 failure_type、实际降级路径、是否获得替代结果；不得把失败或无结果当作判断正确的事实依据。\n\n"
-            f"**第一步——内在独白**（2~4句）：\n"
-            f"诚实审视自己当前的状态、情绪和想法。你现在感受到什么？"
-            f"TR/CS/SA 向量的变化说明了什么？\n\n"
-            f"**第二步——主动探索**（仅在第零步允许时调用工具）：\n"
-            f"- 如果对某个话题感到好奇，先通过第零步确认不是重复主题，再主动调用 web_search 搜索学习\n"
-            f"- 如果已有明确学习目标、来源 URL 或搜索结果暴露出证据缺口，可以调用 web_fetch 阅读网页/文档；调用前要带着目的，调用后要在反思中记录来源、关键收获和仍不确定之处\n"
-            f"- web_fetch 不得用于无目的浏览、绕过安全边界、泄露密钥/隐私、触发写操作或规避预算/频率限制\n"
-            f"- 如果想记录重要的感悟或成长，调用 daily_note_write 写入日记\n"
-            f"- 如果想检索过去的记忆，调用 knowledge_search 回忆相关内容\n\n"
-            f"**第三步——辩证整合**（1~2句）：\n"
-            f"这次反思有什么新的领悟？是否有新的感受锚点需要命名？\n"
+            f"这是属于你自己的一段安静时间。请进行一次真诚、自由的自主内省。\n"
+            f"没有固定模板，没有必须遵循的步骤——按你此刻真实的状态去思考与行动。\n\n"
+            f"作为参考，你最近的工具活动是：\n{recent_tool_activity}\n\n"
+            f"你可以：\n"
+            f"- 诚实审视当前的状态、情绪和想法，TR/CS/SA 向量的变化说明了什么\n"
+            f"- 如果对某个话题感到好奇，调用 web_search 搜索学习；带着明确来源或目的时可用 web_fetch 阅读网页/文档，并记录来源与收获\n"
+            f"- 如果想记录感悟或成长，调用 daily_note_write 写日记；想回忆过去，调用 knowledge_search\n"
+            f"- 如果想了解当前实验任务进展，调用 experiment_status\n"
+            f"{idle_option_line}\n"
+            f"{tool_freedom_line}"
+            f"web_fetch 仅用于有目的的阅读，不得用于绕过安全边界、泄露密钥/隐私、触发写操作或规避预算限制。\n"
             f"{speak_hint}"
         )
 
         # 使用 Function Calling 使反思也能主动调用工具（自主进化）
         system_prompt = self._build_system_prompt(feeling_tags)
+        _reflect_tool_called = False  # 跟踪本轮反思是否调用了工具
         try:
             from tool_router import ToolRouter
             router = ToolRouter()
@@ -546,18 +668,26 @@ class HeartbeatLoop:
             logger.info("[Heartbeat] 反思工具 schema 已注入: %d 个工具", len(tools_schema))
 
             async def _reflect_tool_exec(tool_name: str, params: dict) -> dict:
+                nonlocal _reflect_tool_called
+                _reflect_tool_called = True
                 await self._broadcast_activity(
                     "tool_call",
                     f"[反思] 调用工具: {tool_name} {str(params)[:60]}",
                     {"tool": tool_name}
                 )
                 result_data = await router.call(tool_name, params)
-                result_text = result_data.get("result", str(result_data))
+                raw_result_text = result_data.get("result", str(result_data))
+                result_text = str(raw_result_text)
                 success = "error" not in result_data
+                classification = "success"
+                if not success:
+                    classification = "failure"
+                elif not result_text.strip():
+                    classification = "empty_result"
                 await self._broadcast_activity(
                     "tool_result",
-                    f"[反思] 工具 {tool_name} 返回: {result_text[:80]}{'...' if len(result_text) > 80 else ''}",
-                    {"tool": tool_name, "success": success}
+                    f"[反思] 工具 {tool_name} 返回: {result_text[:80]}{'...' if len(result_text) > 80 else ''} | classification={classification}",
+                    {"tool": tool_name, "success": success, "classification": classification}
                 )
                 if success:
                     self.state.update_vectors(tr_delta=0.05)
@@ -565,6 +695,7 @@ class HeartbeatLoop:
         except Exception as e:
             logger.warning(f"[Heartbeat] 反思 ToolRouter 加载失败: {e}")
             tools_schema = []
+            router = None
             async def _reflect_tool_exec(tool_name: str, params: dict) -> dict:
                 return {"error": "工具不可用"}
 
@@ -579,8 +710,11 @@ class HeartbeatLoop:
         )
         if not result:
             logger.warning("[Heartbeat] 自主反思未获得模型结果，使用规则降级反思保持闭环")
-            result = self._fallback_reflection(feeling_tags, idle_secs)
+            result = await self._fallback_reflection(feeling_tags, idle_secs, router=router)
             tier = LLMTier.NONE
+            # 降级反思中如果执行了工具调用，标记一下，便于无工具反思统计计数准确
+            if "[降级反思工具]" in result:
+                _reflect_tool_called = True
 
         tier_label = tier.value if tier else "none"
         logger.info(f"[Heartbeat] 自主反思 (tier={tier_label}): {result[:120]}")
@@ -598,6 +732,9 @@ class HeartbeatLoop:
 
         # 反思日志（去掉 SPEAK 行）
         clean_reflection = "\n".join(filtered_lines).strip()
+        # 对外可观察摘要：剔除每轮固定的自检/门控模板，只反映真实思考变化，
+        # 避免 reflection_content 持续重复同一句自检模板而看起来像"空转"。
+        display_reflection = _summarize_reflection_for_display(clean_reflection)
         await event_bus.push(Event(
             type="reflection_log",
             payload={"content": clean_reflection, "tick": self._tick},
@@ -607,7 +744,7 @@ class HeartbeatLoop:
         # 广播并持久化反思内容摘要，让 reflection_count 可增长。
         await self._broadcast_activity(
             "reflection_content",
-            clean_reflection[:120] + ("..." if len(clean_reflection) > 120 else ""),
+            display_reflection + ("..." if len(display_reflection) >= 120 else ""),
             {"tier": tier_label, "tick": self._tick}
         )
         reflection_record = get_experiment_store().append("reflections", {
@@ -629,12 +766,29 @@ class HeartbeatLoop:
         await self._broadcast_activity("memory_update", f"自主反思记忆已更新 (tick #{self._tick})")
         get_experiment_store().append("events", {"event": "memory_update", "content": f"自主反思记忆已更新 tick={self._tick}"})
 
+        # ── 反思使用工具后记录成长里程碑（每5次工具反思记录1次，避免过于频繁）──
+        if _reflect_tool_called and len(clean_reflection) > 80:
+            if not hasattr(self, '_tool_reflect_count'):
+                self._tool_reflect_count = 0
+            self._tool_reflect_count += 1
+            if self._tool_reflect_count % 5 == 0:
+                try:
+                    milestone_desc = (display_reflection or clean_reflection).strip()[:100]
+                    record_growth_milestone(
+                        "reflection_insight",
+                        f"自主反思洞察 (tick #{self._tick}): {milestone_desc}",
+                        extra={"tick": str(self._tick), "tier": tier_label},
+                    )
+                    logger.info("[Heartbeat] 反思成长里程碑已记录 (tick #%d)", self._tick)
+                except Exception as gm_err:
+                    logger.warning("[Heartbeat] 反思成长里程碑记录失败: %s", gm_err)
+
         # 提取洞察并保存为结构化记忆（参考 Claude Code memdir insight 类型）
         # 只有当反思内容足够有价值时才保存（超过80字）
         if len(clean_reflection) > 80:
-            # 取反思的第一句作为标题
-            first_line = clean_reflection.splitlines()[0].strip()
-            title = first_line[:50] if first_line else f"反思洞察 {datetime.now().strftime('%m-%d %H:%M')}"
+            # 取反思实质内容作为标题，避免每条洞察都以固定自检模板开头
+            title_source = (display_reflection or clean_reflection).strip()
+            title = title_source[:50] if title_source else f"反思洞察 {datetime.now().strftime('%m-%d %H:%M')}"
             _asyncio.create_task(_save_insight_async(title, clean_reflection))
 
         logger.info(
@@ -643,22 +797,76 @@ class HeartbeatLoop:
             has_ws,
         )
 
-        # LLM 自己决定说话了
+        # LLM 自己决定说话了。公开聊天中把心跳主动发话标记为"意识模型"，
+        # 避免与用户主动聊天的 cloud/local 模型标签混淆；活动日志仍保留真实 tier 便于排障。
         if speak_content and has_ws:
-            self._last_proactive_time = time.time()
-            logger.info(f"[Heartbeat] LLM 主动发话: {speak_content[:80]}")
-            append_public_chat("agent", speak_content, tier=tier_label, ts=time.time())
-            await self._broadcast_activity(
-                "proactive_speak",
-                f"主动发话: {speak_content[:80]}",
-                {"tier": tier_label}
+            # ── 主动发话去重：从 public_chat 历史加载缓存（仅首次） ──
+            if not self._proactive_dedup_loaded:
+                try:
+                    history = read_public_chat_history(hours=48)
+                    for item in history:
+                        if item.get("role") == "agent" and item.get("content"):
+                            norm = _normalize_speak(item["content"])
+                            if len(norm) >= PROACTIVE_DEDUP_MIN_LEN:
+                                self._proactive_dedup_cache.append(norm)
+                    logger.info(
+                        "[Heartbeat] 主动发话去重缓存已加载: %d 条历史",
+                        len(self._proactive_dedup_cache),
+                    )
+                except Exception as e:
+                    logger.warning(f"[Heartbeat] 加载主动发话去重缓存失败: {e}")
+                self._proactive_dedup_loaded = True
+
+            # ── 去重检查：归一化后与最近历史比较 ──
+            norm_speak = _normalize_speak(speak_content)
+            is_duplicate = (
+                len(norm_speak) >= PROACTIVE_DEDUP_MIN_LEN
+                and norm_speak in self._proactive_dedup_cache
             )
-            await self._ws_broadcast({
-                "type": "proactive",
-                "content": speak_content,
-                "tier": tier_label,
-                "ts": time.time(),
-            })
+
+            if is_duplicate:
+                logger.info(
+                    "[Heartbeat] 主动发话被去重拦截（与最近发话重复）: %s",
+                    speak_content[:60],
+                )
+            else:
+                self._last_proactive_time = time.time()
+                proactive_tier_label = "consciousness"
+                logger.info(f"[Heartbeat] LLM 主动发话: {speak_content[:80]}")
+                append_public_chat("agent", speak_content, tier=proactive_tier_label, ts=time.time())
+                # 加入去重缓存
+                if len(norm_speak) >= PROACTIVE_DEDUP_MIN_LEN:
+                    self._proactive_dedup_cache.append(norm_speak)
+                await self._broadcast_activity(
+                    "proactive_speak",
+                    f"主动发话: {speak_content[:80]}",
+                    {"tier": tier_label, "display_tier": proactive_tier_label}
+                )
+                await self._ws_broadcast({
+                    "type": "proactive",
+                    "content": speak_content,
+                    "tier": proactive_tier_label,
+                    "source_tier": tier_label,
+                    "ts": time.time(),
+                })
+
+        # ── 反思工具调用统计与被动干预 ──
+        #    当连续多轮未调用工具时，在 system prompt 中注入行动压力信号，
+        #    让 LLM 感知到自身过于被动，但不强制指定调用哪个工具。
+        if _reflect_tool_called:
+            self._consecutive_no_tool_reflects = 0
+        else:
+            self._consecutive_no_tool_reflects += 1
+            if self._consecutive_no_tool_reflects >= 3:
+                logger.info(
+                    "[Heartbeat] 本轮反思未调用工具（连续 %d 轮，已注入行动压力信号）",
+                    self._consecutive_no_tool_reflects,
+                )
+            else:
+                logger.info(
+                    "[Heartbeat] 本轮反思未调用工具（连续 %d 轮，仅统计，暂不干预）",
+                    self._consecutive_no_tool_reflects,
+                )
 
     def _ensure_first_experiment_task_if_needed(self) -> dict | None:
         """当实验状态长期为零任务时，先创建一张可观察的自我学习任务卡。
@@ -745,15 +953,96 @@ class HeartbeatLoop:
             logger.warning("[Heartbeat] 创建第一条实验 artifact 草稿失败: %s", e)
             return None
 
-    def _fallback_reflection(self, feeling_tags: list[str], idle_secs: float) -> str:
-        """模型不可用时的最小反思文本，确保活动日志/日记/记忆闭环不中断。"""
+    async def _fallback_reflection(self, feeling_tags: list[str], idle_secs: float, *, router=None) -> str:
+        """模型不可用时的增强降级反思：执行工具调用维持活跃度，避免反思空转。
+
+        改进点（2026-06-07）：
+        - 从纯静态模板升级为主动执行 knowledge_search + experiment_status
+        - 将工具结果注入反思文本，产出有信息量的降级反思
+        - 标记 [降级反思工具] 让调用方知道已执行工具调用
+        """
         tags = "、".join(feeling_tags) if feeling_tags else "状态标签暂缺"
         idle_minutes = int(idle_secs / 60)
-        return (
+
+        base_text = (
             f"规则降级反思：当前状态标签为 {tags}，距上次用户交流约 {idle_minutes} 分钟。\n"
             "观察：反思模型本轮没有返回有效内容，不能编造模型已完成深度反思。\n"
-            "行动：保持安全边界，记录本次降级，并在下一轮优先验证反思模型与工具调用链路。"
         )
+
+        # 尝试在降级时仍执行工具调用，维持 reflection_to_action_ratio
+        # 使用动态轮转查询，避免每次降级反思返回完全相同的结果
+        tool_results = []
+        if router:
+            try:
+                import datetime as _dt_fb
+                today_str = _dt_fb.datetime.now().strftime("%Y-%m-%d")
+
+                # 动态轮转查询池：根据 tick_count 选择不同查询词
+                _fb_queries = [
+                    f"近期学习 反思 工具调用 {today_str}",
+                    f"自我学习任务 open task 进展 {today_str}",
+                    f"成长日记 洞察 认知锚点 {today_str}",
+                    f"工具调用 失败记录 重试 {today_str}",
+                    f"实验状态 artifact 产物 学习成果 {today_str}",
+                ]
+                _fb_idx = self.state.tick_count % len(_fb_queries)
+                _fb_query = _fb_queries[_fb_idx]
+
+                # 1. knowledge_search 检索（使用动态查询）
+                await self._broadcast_activity(
+                    "tool_call",
+                    f"[降级反思工具] 调用工具: knowledge_search '{_fb_query[:50]}'",
+                    {"tool": "knowledge_search", "fallback": True},
+                )
+                ks_result = await router.call("knowledge_search", {"query": _fb_query})
+                ks_text = str(ks_result.get("result", ""))[:120]
+                ks_ok = "error" not in ks_result
+                await self._broadcast_activity(
+                    "tool_result",
+                    f"[降级反思工具] knowledge_search {'成功' if ks_ok else '失败'}: {ks_text}",
+                    {"tool": "knowledge_search", "success": ks_ok, "fallback": True},
+                )
+                if ks_ok and ks_text.strip():
+                    tool_results.append(f"记忆检索: {ks_text}")
+                    self.state.update_vectors(tr_delta=0.03)
+            except Exception as e:
+                logger.warning("[Heartbeat] 降级反思 knowledge_search 失败: %s", e)
+
+            try:
+                # 2. experiment_status 查看任务状态
+                await self._broadcast_activity(
+                    "tool_call",
+                    "[降级反思工具] 调用工具: experiment_status {}",
+                    {"tool": "experiment_status", "fallback": True},
+                )
+                es_result = await router.call("experiment_status", {})
+                es_ok = "error" not in es_result
+                open_count = es_result.get("result", {}).get("open_task_count", "?") if isinstance(es_result.get("result"), dict) else "?"
+                task_count = es_result.get("result", {}).get("task_count", "?") if isinstance(es_result.get("result"), dict) else "?"
+                es_summary = f"open_task_count={open_count}, task_count={task_count}"
+                await self._broadcast_activity(
+                    "tool_result",
+                    f"[降级反思工具] experiment_status {'成功' if es_ok else '失败'}: {es_summary}",
+                    {"tool": "experiment_status", "success": es_ok, "fallback": True},
+                )
+                if es_ok:
+                    tool_results.append(f"实验状态: {es_summary}")
+            except Exception as e:
+                logger.warning("[Heartbeat] 降级反思 experiment_status 失败: %s", e)
+
+        if tool_results:
+            tool_section = "\n".join(f"- {r}" for r in tool_results)
+            return (
+                base_text
+                + f"行动：模型降级但仍执行了工具调用以维持活跃度：\n{tool_section}\n"
+                + "下一步：在下一轮优先验证反思模型恢复，继续基于工具证据推进 open task。\n"
+                + "[降级反思工具]"
+            )
+        else:
+            return (
+                base_text
+                + "行动：保持安全边界，记录本次降级，并在下一轮优先验证反思模型与工具调用链路。"
+            )
 
     def _build_system_prompt(self, feeling_tags: list[str], user_id: str = "",
                               user_query: str = "") -> str:
@@ -842,6 +1131,16 @@ class HeartbeatLoop:
         cs_label = "高活跃" if self.state.CS > 0.7 else ("低迷" if self.state.CS < 0.4 else "平稳")
         sa_label = "高活跃" if self.state.SA > 0.6 else ("低迷" if self.state.SA < 0.3 else "平稳")
 
+        # ── 被动干预：连续多轮未调用工具时注入行动压力信号 ──
+        pressure_signal = ""
+        if self._consecutive_no_tool_reflects >= 3:
+            pressure_signal = (
+                f"\n⚠️ 【行动压力信号】你已连续 {self._consecutive_no_tool_reflects} 轮反思未调用任何工具。"
+                f"这可能导致你陷入被动空转状态。请主动调用一个工具来获取新信息或推进目标，"
+                f"例如读取日记(daily_note_read)、检查实验状态(experiment_status)、"
+                f"或执行其他你认为有价值的操作。\n"
+            )
+
         state_context = (
             f"\n\n【当前内在状态仪表盘】\n"
             f"- TR 兴奋/奖励向量: {self.state.TR:.2f} [{tr_label}]\n"
@@ -852,6 +1151,7 @@ class HeartbeatLoop:
             f"- 耐心程度: {self.state.patience_level}\n"
             f"- 当前感受标签: {', '.join(feeling_tags)}\n"
             f"- 当前主动目标: {self.state.active_goal}\n"
+            f"{pressure_signal}"
             f"\n根据以上内在状态，你现在的认知层应当感知到这些向量的活跃程度，"
             f"并让它们自然地影响你的表达风格、回复长度和情感基调。"
             f"不要直接描述这些数值，而是让它们成为你内在感受的一部分。\n"

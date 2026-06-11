@@ -59,12 +59,15 @@ def collect_metrics(hours: int = 24, limit: int = 1000) -> dict[str, Any]:
         "tool_failure_count": 0,
         "tool_success_count": 0,
         "external_tool_failure_count": 0,
+        "tool_failure_breakdown": {},
         "reflection_count": 0,
         "proactive_count": 0,
         "memory_update_count": 0,
         "memory_compress_count": 0,
         "chat_success_rate": 1.0,
         "tool_success_rate": 1.0,
+        "reflection_to_action_ratio": 0.0,
+        "reflection_to_action_status": "unknown",
         "last_events": [],
         "experiment_task_count": 0,
         "experiment_artifact_count": 0,
@@ -151,6 +154,9 @@ def _count_activity(metrics: dict[str, Any], item: dict[str, Any]) -> None:
         metrics["tool_result_count"] += 1
         if _is_tool_failure(content):
             metrics["tool_failure_count"] += 1
+            category = _classify_tool_failure(content)
+            breakdown = metrics.setdefault("tool_failure_breakdown", {})
+            breakdown[category] = int(breakdown.get(category, 0)) + 1
             if any(name in content for name in _EXTERNAL_TOOL_NAMES):
                 metrics["external_tool_failure_count"] += 1
     elif event in {"reflection_start", "reflection_content"}:
@@ -284,6 +290,33 @@ def _is_tool_failure(content: str) -> bool:
     return any(marker in text for marker in ("error", "失败", "不可用", "timeout", "403", "429", "521"))
 
 
+# 失败类型分类规则：按优先级匹配，第一个命中的类别即为该失败的归类。
+# 仅对已判定为失败的内容调用，用于把聚合的 tool_failure_count 拆分成可区分的
+# 失败画像，使进化 backlog 能生成差异化提案，避免 NO_PATCH 空循环。
+_FAILURE_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("rate_limited", ("429", "rate limit", "too many requests", "频率", "限流")),
+    ("forbidden", ("403", "forbidden", "unauthorized", "401", "无权", "拒绝访问")),
+    ("upstream_error", ("521", "522", "523", "502", "503", "504", "bad gateway", "gateway")),
+    ("timeout", ("timeout", "timed out", "超时")),
+    ("unavailable", ("不可用", "unavailable", "connection", "连接", "网络", "network")),
+]
+
+
+def _classify_tool_failure(content: str) -> str:
+    """Map a failed tool_result into a coarse failure category.
+
+    Only called for entries already classified as failures by
+    :func:`_is_tool_failure`. Returns a stable category key so the backlog
+    builder can produce differentiated, evidence-rich proposals instead of
+    repeating an identical generic proposal every cycle.
+    """
+    text = (content or "").lower()
+    for category, markers in _FAILURE_CATEGORY_RULES:
+        if any(marker in text for marker in markers):
+            return category
+    return "other_error"
+
+
 def _finalize_rates(metrics: dict[str, Any]) -> None:
     replies = int(metrics.get("agent_reply_count") or 0)
     failed = int(metrics.get("failed_reply_count") or 0)
@@ -294,5 +327,20 @@ def _finalize_rates(metrics: dict[str, Any]) -> None:
     tool_success = max(0, tool_results - tool_failed)
     metrics["tool_success_count"] = tool_success
     metrics["tool_success_rate"] = round(tool_success / tool_results, 4) if tool_results > 0 else 1.0
+
+    reflections = int(metrics.get("reflection_count") or 0)
+    actions = int(metrics.get("tool_call_count") or 0) + int(metrics.get("proactive_count") or 0)
+    ratio = round(actions / reflections, 4) if reflections > 0 else 0.0
+    metrics["reflection_to_action_ratio"] = ratio
+    if reflections <= 0:
+        metrics["reflection_to_action_status"] = "no_reflection"
+    elif ratio < 0.10:
+        metrics["reflection_to_action_status"] = "too_passive"
+    elif ratio > 0.70:
+        # 只有 action/reflection 超过 0.70 才算 too_reactive；
+        # 0.30~0.70 区间是反思中积极使用工具的正常表现。
+        metrics["reflection_to_action_status"] = "too_reactive"
+    else:
+        metrics["reflection_to_action_status"] = "balanced"
 
     metrics["last_events"] = sorted(metrics.get("last_events", []), key=lambda x: x.get("ts", 0))[-50:]

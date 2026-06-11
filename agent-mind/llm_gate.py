@@ -14,6 +14,27 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_content(message: dict) -> str:
+    """从 API 响应 message 中提取纯文本 content。
+
+    兼容两种格式：
+    1. 标准 OpenAI 格式：content 为纯文本字符串
+    2. 结构化格式：content 为 [{"type": "output_text", "text": "..."}] 列表
+    """
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
 # 随镜像发布的运行时人格与 AIwake 规则路径。
 # 不放在 data/ 下：生产环境 /app/data 是 Fly volume，会覆盖镜像内文件。
 PROMPTS_DIR = Path(__file__).parent / "runtime_prompts"
@@ -199,7 +220,7 @@ class LLMGate:
                     }
                 )
                 resp.raise_for_status()
-                return resp.json()["message"]["content"]
+                return _extract_content(resp.json()["message"])
         except Exception as e:
             logger.warning(f"[LLM Gate] 本地模型调用失败: {e}")
             return ""
@@ -251,7 +272,7 @@ class LLMGate:
                     }
                 )
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                return _extract_content(resp.json()["choices"][0]["message"])
         except Exception as e:
             logger.error(f"[LLM Gate] {profile.name} API 调用失败: {e}")
             return ""
@@ -263,8 +284,20 @@ class LLMGate:
         work = self.profiles.get("work")
         return bool(work and work.configured and work.name != profile.name)
 
-    async def call_reflect_messages(self, messages: list[dict]) -> str:
-        """调用心跳/反思模型；反思 profile 失败时安全回退 work，再回退本地模型。"""
+    async def call_reflect_messages(
+        self,
+        messages: list[dict],
+        *,
+        tools_schema: list[dict] | None = None,
+        tool_executor=None,
+        max_rounds: int = 8,
+    ) -> str:
+        """调用心跳/反思模型；反思 profile 失败时安全回退 work，再回退本地模型。
+
+        如果传入 ``tools_schema`` + ``tool_executor``，反思将走原生 Function Calling 路径
+        （call_with_tools），让反思 LLM 能像 /chat 一样真实调用工具（goal_register、
+        self_code_write 等）。否则走旧的纯文本路径作为兜底。
+        """
         profile = self._get_profile("reflect")
         if profile.configured:
             system_prompt = ""
@@ -272,6 +305,24 @@ class LLMGate:
             if messages and messages[0].get("role") == "system":
                 system_prompt = messages[0].get("content", "")
                 payload_messages = messages[1:]
+            # 真工具路径：反思层带 tools 调用，max_rounds 限制工具循环
+            if tools_schema and tool_executor:
+                try:
+                    result, _tier = await self.call_with_tools(
+                        system_prompt=system_prompt,
+                        messages=payload_messages,
+                        tools_schema=tools_schema,
+                        tool_executor=tool_executor,
+                        user_id="evolution_reflect",
+                        max_rounds=max_rounds,
+                        profile_name="reflect",
+                    )
+                    if result:
+                        return result
+                    logger.warning("[LLM Gate] reflect 真工具路径无结果，回退到无工具反思")
+                except Exception as e:
+                    logger.warning(f"[LLM Gate] reflect 真工具路径异常: {e}，回退到无工具反思")
+            # 兜底：无工具反思（兼容旧调用方与失败回退）
             user_message = "\n\n".join(m.get("content", "") for m in payload_messages if m.get("role") == "user")
             result = await self.call_cloud(system_prompt, user_message, profile_name="reflect")
             if result:
@@ -358,7 +409,7 @@ class LLMGate:
                 profile_name=profile.name,
             )
             if data:
-                result = data["choices"][0]["message"].get("content", "")
+                result = _extract_content(data["choices"][0]["message"])
                 if result:
                     logger.info(f"[LLM Gate] {profile.name} API 调用成功（AIwake 人格已注入）")
                     return result, LLMTier.CLOUD
@@ -379,7 +430,7 @@ class LLMGate:
         tools_schema: list[dict],
         tool_executor,
         user_id: str = "default",
-        max_rounds: int = 5,
+        max_rounds: int = 8,
         profile_name: str = "work",
     ) -> tuple[str, "LLMTier"]:
         """
@@ -480,7 +531,7 @@ class LLMGate:
 
                 else:
                     # finish_reason == "stop"，普通文本回复，结束循环
-                    result = message.get("content", "")
+                    result = _extract_content(message)
                     if result:
                         logger.info(f"[LLM Gate] call_with_tools 完成（{round_num+1}轮），tier=cloud")
                         return result, LLMTier.CLOUD
@@ -515,7 +566,7 @@ class LLMGate:
             )
             if data is not None:
                 try:
-                    result = data["choices"][0]["message"].get("content", "")
+                    result = _extract_content(data["choices"][0]["message"])
                     if result:
                         logger.info("[LLM Gate] call_with_tools 工具结果总结完成，tier=cloud")
                         return result, LLMTier.CLOUD

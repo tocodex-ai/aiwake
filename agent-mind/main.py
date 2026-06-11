@@ -29,12 +29,81 @@ from experiment_store import get_experiment_store
 from safety_guard import redact_secrets
 from evolution.metrics import collect_metrics
 from evolution.self_upgrade import proposal_status_summary, read_proposals, record_approval_status
+from evolution.growth_tracker import growth_chart_data, read_milestones, record_growth_milestone
+from evolution.goal_tracker import (
+    register_goal,
+    read_all_goals,
+    read_open_goals,
+    read_capabilities,
+    METRIC_REGISTRY,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ── 突破性事件自动检测 ──
+# AIwake 主动分析自身代码或生成修改方案时，自动记录成长里程碑
+_BREAKTHROUGH_DEDUP: dict[str, float] = {}  # event_type -> last_recorded_ts
+_BREAKTHROUGH_DEDUP_WINDOW = 3600  # 同类突破事件1小时内只记录一次
+
+# 自身源码路径关键词，匹配这些说明 AIwake 在分析自己
+_SELF_CODE_KEYWORDS = frozenset({
+    "engine.py", "heartbeat.py", "main.py", "tool_router.py",
+    "growth_tracker.py", "self_upgrade.py", "evolution/", "llm_gate.py",
+    "autonomy_config.py", "experiment_runner.py", "safety_guard.py",
+})
+
+
+def _try_record_breakthrough(tool_name: str, params: dict, result: dict, success: bool) -> None:
+    """检测并记录突破性成长事件（去重，每类每小时最多一次）。"""
+    if not success:
+        return
+
+    now = time.time()
+    event_type = ""
+    description = ""
+
+    # 1. AIwake 通过 shell_exec 分析自身代码（cat/grep/head 等读取 .py 文件）
+    if tool_name == "shell_exec":
+        cmd = str(params.get("command", ""))
+        if any(kw in cmd for kw in _SELF_CODE_KEYWORDS):
+            event_type = "self_code_analysis"
+            description = f"通过 shell_exec 分析自身代码: {cmd[:80]}"
+
+    # 2. AIwake 通过 file_read 读取自身源码
+    elif tool_name == "file_read":
+        path = str(params.get("path", ""))
+        if path.endswith(".py") and any(kw in path for kw in _SELF_CODE_KEYWORDS):
+            event_type = "self_code_analysis"
+            description = f"通过 file_read 分析自身代码: {path}"
+
+    # 3. AIwake 尝试 self_code_write（在 chat 中发起自我修改）
+    elif tool_name == "self_code_write":
+        event_type = "upgrade_plan_generated"
+        path = str(params.get("path", ""))
+        description = f"在对话中生成自我修改方案: {path}"
+
+    if not event_type:
+        return
+
+    # 去重检查
+    last_ts = _BREAKTHROUGH_DEDUP.get(event_type, 0)
+    if now - last_ts < _BREAKTHROUGH_DEDUP_WINDOW:
+        return
+
+    _BREAKTHROUGH_DEDUP[event_type] = now
+    try:
+        record_growth_milestone(
+            event_type=event_type,
+            description=description,
+            source_proposal_id="chat_breakthrough_detector",
+        )
+        logger.info(f"[Breakthrough] 记录突破性成长事件: {event_type} - {description[:60]}")
+    except Exception as exc:
+        logger.warning(f"[Breakthrough] 记录失败: {exc}")
 
 # ──────────────────────────────────────────────
 # 启动时加载人格配置
@@ -113,6 +182,7 @@ _evolution_task: asyncio.Task = None
 _experiment_status_cache: dict | None = None
 _experiment_status_cache_ts: float = 0.0
 _EXPERIMENT_STATUS_CACHE_SECONDS = 20.0
+_EXPERIMENT_STATUS_TIMEOUT_SECONDS = 6.0
 
 # ──────────────────────────────────────────────
 # 对话限流与公开工具安全边界
@@ -269,7 +339,13 @@ def _looks_like_mojibake_question_marks(text: str) -> bool:
 
 
 def _looks_like_mojibake_output(text: str) -> bool:
-    """识别 LLM/历史状态输出中的乱码，避免继续污染 public_chat 与 evolution 证据。"""
+    """识别 LLM/历史状态输出中的乱码，避免继续污染 public_chat 与 evolution 证据。
+
+    2026-06-08 修复：提高多条规则阈值，避免正常 LLM 回复（含少量 ?/U+FFFD 的代码片段、
+    URL 参数、工具调用输出等）被误判为乱码，导致训练消息被 empty_fallback 降级。
+    核心原则：当文本含有大量有意义内容（CJK ≥ 8 或 ASCII 字母 ≥ 30）时，
+    必须有更强的损坏证据才能判定为乱码。
+    """
     stripped = (text or "").strip()
     if len(stripped) < 8:
         return False
@@ -293,53 +369,72 @@ def _looks_like_mojibake_output(text: str) -> bool:
             max_question_run = max(max_question_run, current_question_run)
         else:
             current_question_run = 0
-    # 公开聊天中已经多次出现“证据词 + 密集 ???/�/C1 控制字符”的混合乱码。
-    # 这类内容可能包含 status/health 等英文证据词，不能因为 ASCII 字母较多就视为有效文本。
+
+    # 有意义文本的强信号：含有充足的中文或英文字母时，需要更强的乱码证据才触发降级。
+    has_strong_meaningful_text = cjk_count >= 8 or ascii_alpha_count >= 30
+    has_meaningful_text = cjk_count >= 4 or ascii_alpha_count >= 12
+
+    # ── 极端乱码模式：无论有无有意义文本都直接拦截 ──
+    # 公开聊天中已经多次出现"证据词 + 密集 ???/�/C1 控制字符"的混合乱码。
     if stripped.startswith("a?|a?|"):
         return True
-    if cjk_count == 0 and question_count >= 8 and (replacement_count + c1_control_count) >= 1:
+    if stripped.startswith("??") and question_count >= 6 and (replacement_count + c1_control_count) >= 3:
         return True
-    if cjk_count == 0 and question_count >= 12 and max_question_run >= 2:
+    if stripped.startswith("?") and damaged_count >= 20 and damaged_ratio >= 0.15 and cjk_count < max(4, visible_count * 0.35):
         return True
-    if replacement_count >= 2 and question_count >= 10 and max_question_run >= 3:
+
+    # 当文本含有大量有意义内容时，仅对极端损坏（高密度 C1 + 高 ratio）才判定为乱码
+    if has_strong_meaningful_text:
+        # 只有 C1 控制字符极度密集才拦截
+        if c1_control_count >= 15 and (c1_control_count / visible_count) >= 0.15:
+            return True
+        # 只有 U+FFFD 极度密集才拦截
+        if replacement_count >= 10 and damaged_ratio >= 0.20:
+            return True
+        # 有大量有意义文本时不再触发其他规则
+        return False
+
+    # ── 以下规则仅在文本不含强有意义内容时才检查 ──
+    if cjk_count == 0 and question_count >= 12 and (replacement_count + c1_control_count) >= 2:
         return True
-    if (replacement_count + c1_control_count) >= 2 and question_count >= 8 and max_question_run >= 3:
+    if cjk_count == 0 and question_count >= 15 and max_question_run >= 3:
         return True
-    if cjk_count == 0 and question_count >= 6 and stripped.count("??") >= 3:
+    if replacement_count >= 3 and question_count >= 10 and max_question_run >= 3:
         return True
-    if (replacement_count + c1_control_count) >= 6 and question_count >= 6:
+    if (replacement_count + c1_control_count) >= 3 and question_count >= 10 and max_question_run >= 4:
         return True
-    has_meaningful_text = cjk_count >= 4 or ascii_alpha_count >= 12
-    bracketed_agent_failure = stripped.startswith("[Agent") and (question_count >= 4 or replacement_count >= 1)
+    if cjk_count == 0 and question_count >= 8 and stripped.count("??") >= 4:
+        return True
+    if (replacement_count + c1_control_count) >= 8 and question_count >= 8:
+        return True
+    bracketed_agent_failure = stripped.startswith("[Agent") and (question_count >= 6 or replacement_count >= 2)
     if bracketed_agent_failure:
         return True
     # 云端模型偶发输出会混入少量真实中文，但整体仍由 ?/�/C1 控制字符主导。
-    # 这类文本如果放过，会继续污染 public_chat 与 evolution 指标，所以用更强证据阈值拦截。
-    if damaged_count >= 30 and damaged_ratio >= 0.20 and (replacement_count + c1_control_count) >= 4:
+    if damaged_count >= 30 and damaged_ratio >= 0.25 and (replacement_count + c1_control_count) >= 6:
         return True
-    # 本轮线上验证发现：云端回复可能几乎没有 U+FFFD/问号，却含有高密度 C1 控制字符。
-    # C1 控制字符不应出现在正常中文回答中；达到该阈值时优先安全降级，避免污染公开聊天。
-    if c1_control_count >= 8 and (c1_control_count / visible_count) >= 0.08 and cjk_count < max(4, visible_count * 0.25):
+    # C1 控制字符不应出现在正常中文回答中
+    if c1_control_count >= 10 and (c1_control_count / visible_count) >= 0.10 and cjk_count < max(4, visible_count * 0.25):
         return True
-    if replacement_count >= 1 and question_count >= 4:
+    # 提高阈值：需要更多 U+FFFD 证据才判定乱码（旧值 >=1 太低）
+    if replacement_count >= 4 and question_count >= 8:
         return True
-    if replacement_count >= 8 and damaged_ratio >= 0.08:
+    if replacement_count >= 10 and damaged_ratio >= 0.10:
         return True
-    if question_count >= 12 and damaged_ratio >= 0.18:
+    # 以下规则已在上方统一处理，仅保留高阈值的兜底规则
+    if question_count >= 15 and damaged_ratio >= 0.25:
         return True
-    if question_count >= 12 and damaged_ratio >= 0.12 and cjk_count < max(4, visible_count * 0.50):
+    if cjk_count == 0 and question_count >= 10 and damaged_ratio >= 0.25:
         return True
-    if cjk_count == 0 and question_count >= 6 and damaged_ratio >= 0.22:
+    if cjk_count == 0 and damaged_count >= 15 and damaged_ratio >= 0.18:
         return True
-    if cjk_count == 0 and damaged_count >= 10 and damaged_ratio >= 0.12:
+    if cjk_count == 0 and question_count >= 8 and (replacement_count + c1_control_count) >= 4:
         return True
-    if cjk_count == 0 and question_count >= 4 and (replacement_count + c1_control_count) >= 2:
-        return True
-    if (replacement_count + c1_control_count >= 4 and damaged_ratio >= 0.08) or (
-        not has_meaningful_text and damaged_ratio >= 0.28 and damaged_count >= 8
+    if (replacement_count + c1_control_count >= 6 and damaged_ratio >= 0.12) or (
+        not has_meaningful_text and damaged_ratio >= 0.35 and damaged_count >= 12
     ):
         return True
-    if c1_control_count >= 8 and c1_control_count / visible_count >= 0.08:
+    if c1_control_count >= 12 and c1_control_count / visible_count >= 0.12:
         return True
 
     # 兼容 UTF-8 中文被当作 Latin-1/Windows-1252 解码后的典型形态，例如
@@ -372,6 +467,43 @@ def _extract_self_artifact_task_id(text: str) -> str | None:
     import re as _re
     match = _re.search(r"tas_[A-Za-z0-9_\-]+", text or "")
     return match.group(0) if match else None
+
+
+def _is_explicit_self_task_update_request(text: str) -> bool:
+    """仅在用户明确要求立即/必须调用 self_task_update 时触发确定性关闭。
+
+    task-30 训练常会写“若 done_when 已满足，可调用 self_task_update”或
+    “再决定是否 self_task_update”。这类条件句必须交给模型/工具链先验证
+    done_when，不能被确定性直通误判为立即关闭任务。
+    """
+    msg_text = text or ""
+    msg_lower = msg_text.lower()
+    if "self_task_update" not in msg_lower:
+        return False
+    update_imperative = (
+        "优先调用 self_task_update" in msg_text
+        or "必须调用 self_task_update" in msg_text
+        or "立即调用 self_task_update" in msg_text
+        or "调用 self_task_update，" in msg_text
+        or "调用 self_task_update," in msg_text
+        or "调用 self_task_update\n" in msg_text
+        or "close this task" in msg_lower
+    )
+    update_conditional = any(
+        marker in msg_text
+        for marker in (
+            "可调用 self_task_update",
+            "可以调用 self_task_update",
+            "可再调用 self_task_update",
+            "再决定 self_task_update",
+            "决定是否 self_task_update",
+            "再决定是否 self_task_update",
+            "若 done_when 已满足，可调用 self_task_update",
+            "如 done_when 已满足，可调用 self_task_update",
+        )
+    )
+    return update_imperative and not update_conditional
+
 
 
 def _extract_labeled_prompt_value(text: str, label: str, *, default: str = "") -> str:
@@ -414,10 +546,7 @@ async def _run_deterministic_self_learning_tool(user_message: str, tool_executor
         "self_artifact_create" in msg_lower
         and ("优先调用 self_artifact_create" in msg_text or "调用 self_artifact_create" in msg_text)
     )
-    explicit_task_update_request = (
-        "self_task_update" in msg_lower
-        and ("优先调用 self_task_update" in msg_text or "调用 self_task_update" in msg_text or "close this task" in msg_lower)
-    )
+    explicit_task_update_request = _is_explicit_self_task_update_request(msg_text)
     if explicit_task_update_request:
         task_id = _extract_self_artifact_task_id(msg_text)
         if not task_id:
@@ -514,6 +643,15 @@ class ToolRequest(BaseModel):
 class SelfUpgradeApprovalRequest(BaseModel):
     status: str
     notes: str = ""
+
+
+class GoalRegisterRequest(BaseModel):
+    metric: str
+    direction: str
+    target: float
+    description: str
+    source: str = "reflection"
+    max_cycles: int = 12
 
 
 ACTIVITY_EVENT_LEVELS = {
@@ -698,13 +836,73 @@ async def chat(req: ChatRequest, request: Request):
     if heartbeat:
         await heartbeat._broadcast_activity("llm_call_start", "LLM 推理中…")
 
+    # 单任务状态机：拿锁失败走只读响应（不直接拒绝用户）。
+    _chat_task_id = None
+    _chat_readonly_mode = False
+    _busy_current_payload = None
+    _task_manager = None
     try:
-        from tool_router import ToolRouter as _TR
+        from self_task_manager import get_manager as _get_task_manager
+        _task_manager = _get_task_manager()
+        _busy_title = f"chat:{(req.message or '')[:60]}"
+        _acquired_chat, _busy_current = await _task_manager.try_acquire(
+            kind="chat_session",
+            owner=public_user_id or "default",
+            title=_busy_title,
+            ttl=180,
+            source_request_id=f"chat:{public_user_id}",
+            extra={"len": len(req.message or "")},
+        )
+        if _acquired_chat and _busy_current is not None:
+            _chat_task_id = _busy_current.task_id
+        else:
+            _chat_readonly_mode = True
+            _busy_current_payload = (
+                _busy_current.to_public() if _busy_current is not None else None
+            )
+            try:
+                if heartbeat:
+                    await heartbeat._broadcast_activity(
+                        "chat_readonly_mode",
+                        "AIwake 当前正忙于自任务，本轮 /chat 进入只读模式。",
+                        {"busy": _busy_current_payload or {}},
+                    )
+            except Exception:
+                pass
+    except Exception as _stm_err:
+        logger.warning(f"[Chat] SelfTaskManager 不可用，按非锁定模式继续: {_stm_err}")
+
+    try:
+        from tool_router import ToolRouter as _TR, READONLY_TOOLS as _READONLY_TOOLS
         _router = _TR()
-        _tools_schema = _router.get_openai_tools_schema()
+        _tools_schema_full = _router.get_openai_tools_schema()
+        if _chat_readonly_mode:
+            _tools_schema = [
+                t for t in _tools_schema_full
+                if isinstance(t, dict)
+                and isinstance(t.get("function"), dict)
+                and t["function"].get("name") in _READONLY_TOOLS
+            ]
+        else:
+            _tools_schema = _tools_schema_full
 
         async def _tool_exec(tool_name: str, params: dict) -> dict:
             logger.info(f"[Chat] 执行工具: {tool_name} {params}")
+            if _chat_readonly_mode and tool_name not in _READONLY_TOOLS:
+                blocked = {
+                    "status": "error",
+                    "error": "AIwake 当前正忙于自任务，/chat 处于只读模式，写类工具暂不可用。",
+                    "readonly_mode": True,
+                    "busy": _busy_current_payload or {},
+                    "tool": tool_name,
+                }
+                if heartbeat:
+                    await heartbeat._broadcast_activity(
+                        "tool_blocked_readonly",
+                        f"只读模式拦截写工具: {tool_name}",
+                        {"tool": tool_name, "busy": _busy_current_payload or {}},
+                    )
+                return blocked
             if heartbeat:
                 await heartbeat._broadcast_activity(
                     "tool_call", f"调用工具: {tool_name}", {"tool": tool_name}
@@ -719,12 +917,31 @@ async def chat(req: ChatRequest, request: Request):
                     f"{tool_name} {'成功' if success else '失败'} ({status}) → {result_preview}",
                     {"tool": tool_name, "status": status, "success": success}
                 )
+            try:
+                if _chat_task_id and _task_manager is not None:
+                    await _task_manager.heartbeat(_chat_task_id, last_tool_name=tool_name)
+            except Exception:
+                pass
+            _try_record_breakthrough(tool_name, params, r, success)
             return r
     except Exception as e:
         logger.warning(f"[Chat] ToolRouter 加载失败: {e}")
         _tools_schema = []
         async def _tool_exec(tool_name: str, params: dict) -> dict:
             return {"error": "工具不可用"}
+
+    if _chat_readonly_mode:
+        _busy_kind = (_busy_current_payload or {}).get("kind", "self_task")
+        _busy_title_now = (_busy_current_payload or {}).get("title", "")
+        _busy_started = (_busy_current_payload or {}).get("started_at", "")
+        readonly_notice = (
+            "\n\n【当前会话约束 - 只读模式】\n"
+            f"AIwake 正忙于自任务：kind={_busy_kind}，title={_busy_title_now}，started_at={_busy_started}。\n"
+            "本轮 /chat 仅允许只读工具（如 web_search/web_fetch/file_read/goal_list 等），"
+            "禁止调用 file_write/self_code_write/shell_exec/ssh_exec 等写工具。"
+            "请如实告知用户当前状态，并以只读方式回答。"
+        )
+        system_prompt = system_prompt + readonly_notice
 
     deterministic_result = await _run_deterministic_self_learning_tool(req.message, _tool_exec)
     if deterministic_result:
@@ -735,6 +952,12 @@ async def chat(req: ChatRequest, request: Request):
         append_public_chat("agent", reply, tier=tier_label, user_id=public_user_id)
         await ws_manager.broadcast({"type": "agent_response", "role": "agent", "content": reply, "tier": tier_label, "ts": time.time()})
         logger.info(f"[Chat] 确定性自学习工具直通 ({tier_label}): {reply[:80]}")
+        # 释放状态机锁
+        try:
+            if _chat_task_id and _task_manager is not None:
+                await _task_manager.finish(_chat_task_id, result="ok")
+        except Exception:
+            pass
         return {"reply": reply, "tier": tier_label, "user_id": public_user_id}
 
     result, tier = await heartbeat.llm.call_with_tools(
@@ -761,10 +984,7 @@ async def chat(req: ChatRequest, request: Request):
             "self_artifact_create" in msg_lower
             and ("优先调用 self_artifact_create" in msg_text or "调用 self_artifact_create" in msg_text)
         )
-        explicit_task_update_request = (
-            "self_task_update" in msg_lower
-            and ("优先调用 self_task_update" in msg_text or "调用 self_task_update" in msg_text or "close this task" in msg_lower)
-        )
+        explicit_task_update_request = _is_explicit_self_task_update_request(msg_text)
         if explicit_task_update_request:
             task_id = _extract_self_artifact_task_id(msg_text)
             if task_id:
@@ -870,6 +1090,12 @@ async def chat(req: ChatRequest, request: Request):
     # 同时推送到 WebSocket，让前端页面也能收到
     await ws_manager.broadcast({"type": "agent_response", "role": "agent", "content": reply, "tier": tier_label, "ts": time.time()})
 
+    # 释放状态机锁
+    try:
+        if _chat_task_id and _task_manager is not None:
+            await _task_manager.finish(_chat_task_id, result="ok")
+    except Exception:
+        pass
     return {"reply": reply, "tier": tier_label, "user_id": public_user_id}
 
 
@@ -926,27 +1152,52 @@ async def experiment_status():
     if _experiment_status_cache and now - _experiment_status_cache_ts < _EXPERIMENT_STATUS_CACHE_SECONDS:
         return _experiment_status_cache
 
-    store = get_experiment_store()
-    metrics = collect_metrics(hours=1, limit=500)
-    status = store.status()
-    payload = redact_secrets({
-        "config": load_autonomy_config().to_dict(),
-        "metrics": {
-            "reflection_count": metrics.get("reflection_count", 0),
-            "memory_update_count": metrics.get("memory_update_count", 0),
-            "tool_call_count": metrics.get("tool_call_count", 0),
-            "tool_result_count": metrics.get("tool_result_count", 0),
-            "tool_failure_count": metrics.get("tool_failure_count", 0),
-            "tool_success_count": metrics.get("tool_success_count", max(0, metrics.get("tool_result_count", 0) - metrics.get("tool_failure_count", 0))),
-            "tool_success_rate": metrics.get("tool_success_rate", 1.0),
-            "experiment_task_count": metrics.get("experiment_task_count", 0),
-            "experiment_artifact_count": metrics.get("experiment_artifact_count", 0),
-            "experiment_tool_call_count": metrics.get("experiment_tool_call_count", 0),
-            "experiment_reflection_count": metrics.get("experiment_reflection_count", 0),
-        },
-        "status": status,
-        "cache": {"ttl_seconds": _EXPERIMENT_STATUS_CACHE_SECONDS, "generated_at": time.time()},
-    })
+    async def _build_payload() -> dict:
+        store = get_experiment_store()
+        metrics = await asyncio.to_thread(collect_metrics, hours=1, limit=120)
+        status = await asyncio.to_thread(store.status)
+        return redact_secrets({
+            "config": load_autonomy_config().to_dict(),
+            "metrics": {
+                "reflection_count": metrics.get("reflection_count", 0),
+                "memory_update_count": metrics.get("memory_update_count", 0),
+                "tool_call_count": metrics.get("tool_call_count", 0),
+                "tool_result_count": metrics.get("tool_result_count", 0),
+                "tool_failure_count": metrics.get("tool_failure_count", 0),
+                "tool_success_count": metrics.get("tool_success_count", max(0, metrics.get("tool_result_count", 0) - metrics.get("tool_failure_count", 0))),
+                "tool_success_rate": metrics.get("tool_success_rate", 1.0),
+                "reflection_to_action_ratio": metrics.get("reflection_to_action_ratio", 0.0),
+                "reflection_to_action_status": metrics.get("reflection_to_action_status", "unknown"),
+                "experiment_task_count": metrics.get("experiment_task_count", 0),
+                "experiment_artifact_count": metrics.get("experiment_artifact_count", 0),
+                "experiment_tool_call_count": metrics.get("experiment_tool_call_count", 0),
+                "experiment_reflection_count": metrics.get("experiment_reflection_count", 0),
+                "degraded": metrics.get("degraded", False),
+                "errors": metrics.get("errors", [])[:3],
+            },
+            "status": status,
+            "cache": {"ttl_seconds": _EXPERIMENT_STATUS_CACHE_SECONDS, "generated_at": time.time(), "mode": "fresh"},
+        })
+
+    try:
+        payload = await asyncio.wait_for(_build_payload(), timeout=_EXPERIMENT_STATUS_TIMEOUT_SECONDS)
+    except Exception as exc:
+        if _experiment_status_cache:
+            fallback = dict(_experiment_status_cache)
+            fallback["cache"] = dict(fallback.get("cache") or {})
+            fallback["cache"].update({"mode": "stale_fallback", "generated_at": time.time()})
+            fallback["degraded"] = True
+            fallback["degraded_reason"] = f"experiment_status_timeout_or_error: {type(exc).__name__}"
+            return redact_secrets(fallback)
+        logger.warning("[ExperimentStatus] 快速状态摘要降级: %s", exc)
+        payload = redact_secrets({
+            "config": load_autonomy_config().to_dict(),
+            "metrics": {"degraded": True, "errors": [f"experiment_status_timeout_or_error: {type(exc).__name__}"]},
+            "status": {"degraded": True, "next_plan": "状态摘要暂时超时；先读取 /public_chat 或降低 limit 后重试，不要把超时误判为自学习失败。"},
+            "cache": {"ttl_seconds": _EXPERIMENT_STATUS_CACHE_SECONDS, "generated_at": time.time(), "mode": "minimal_fallback"},
+            "degraded": True,
+        })
+
     _experiment_status_cache = payload
     _experiment_status_cache_ts = now
     return payload
@@ -987,6 +1238,52 @@ async def evolution_status():
     if not evolution_engine:
         return {"status": "not_started", "last_report": None}
     return {"status": "running", "last_report": evolution_engine.last_report}
+
+
+@app.get("/growth/milestones")
+async def growth_milestones(
+    days: int = Query(default=30, ge=1, le=365),
+):
+    """只读查看成长节点与曲线图数据；默认近30天。"""
+    return growth_chart_data(days=days)
+
+
+@app.get("/goal/list")
+async def goal_list(limit: int = Query(default=50, ge=1, le=200)):
+    """只读列出目标闭环记录（开放/已闭合/已放弃）与可用指标。"""
+    return {
+        "metrics": {k: {"direction": v[0], "description": v[1]} for k, v in METRIC_REGISTRY.items()},
+        "open_goals": read_open_goals(),
+        "all_goals": read_all_goals(limit=limit),
+    }
+
+
+@app.get("/goal/capabilities")
+async def goal_capabilities(limit: int = Query(default=50, ge=1, le=200)):
+    """只读查看 AIwake 已沉淀入工具/能力库的可复用能力（来自闭合的目标）。"""
+    return {"items": read_capabilities(limit=limit)}
+
+
+@app.post("/goal/register")
+async def goal_register(req: GoalRegisterRequest, request: Request):
+    """登记一个可度量的改进目标，进入 改→度量→收敛 闭环。
+
+    AIwake 可在反思中通过此端点提出目标需求；evolution 引擎每轮会用当前
+    metrics 复测该目标，达成则自动闭合并记成长事件，超限或显著恶化则放弃。
+    """
+    _require_admin_token(request)
+    try:
+        goal = register_goal(
+            metric=req.metric,
+            direction=req.direction,
+            target=req.target,
+            description=req.description,
+            source=req.source or "reflection",
+            max_cycles=req.max_cycles,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "ok", "goal": goal}
 
 
 @app.get("/self-upgrade/status")
@@ -1053,8 +1350,16 @@ async def set_goal(request: Request):
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
-        # 发送欢迎帧，确认连接
-        await websocket.send_json({"type": "connected", "msg": "WebSocket 已连接"})
+        # 发送欢迎帧，包含当前状态（让前端立即同步 tick 和状态向量）
+        state_data = {}
+        if heartbeat:
+            s = heartbeat.state
+            state_data = {
+                "tick": s.tick_count,
+                "TR": round(s.TR, 2), "CS": round(s.CS, 2), "SA": round(s.SA, 2),
+                "energy": s.energy_level, "mood": s.mood_level, "patience": s.patience_level,
+            }
+        await websocket.send_json({"type": "connected", "msg": "WebSocket 已连接", "state": state_data})
         # 保持连接，等待客户端断开
         while True:
             await websocket.receive_text()   # 忽略客户端发来的 ping/文本

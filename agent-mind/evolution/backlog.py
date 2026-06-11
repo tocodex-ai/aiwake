@@ -7,6 +7,10 @@ from typing import Any
 
 
 _TYPE_RULES: list[tuple[str, str, str]] = [
+    # 转换率类规则必须排在泛化的“反思”规则之前命中，避免 too_passive/too_reactive
+    # 被错误归类成“增强反思频率”这种方向相反的标题。
+    ("转换率过低", "autonomy_improvement", "将近期反思转化为可验证行动"),
+    ("转换率过高", "reliability_improvement", "收敛行动节奏并先固化证据目标"),
     ("工具", "tool_improvement", "提升工具调用可靠性"),
     ("外部", "tool_improvement", "增强外部依赖降级能力"),
     ("失败回复", "reliability_improvement", "降低失败回复率"),
@@ -55,13 +59,20 @@ def build_backlog(evaluation: dict[str, Any], metrics: dict[str, Any]) -> list[d
             ["定位失败回复来源", "增加降级回复或模型重试策略", "验证公开聊天不再出现连续失败"],
         ))
     if float(metrics.get("tool_success_rate", 1.0) or 1.0) < 0.9:
+        breakdown: dict = metrics.get("tool_failure_breakdown") or {}
+        dominant = max(breakdown, key=breakdown.get) if breakdown else "unknown"
         tasks.append(_task(
             "tool_improvement",
-            "提高工具成功率并记录失败分类",
+            f"提高工具成功率：主要失败类型={dominant}",
             0.82,
             "medium",
-            [f"tool_success_rate={metrics.get('tool_success_rate')}", f"tool_failure_count={metrics.get('tool_failure_count')}"] ,
-            ["为失败工具增加重试或替代路径", "验证工具失败不会阻断主回复"],
+            [
+                f"tool_success_rate={metrics.get('tool_success_rate')}",
+                f"tool_failure_count={metrics.get('tool_failure_count')}",
+                f"dominant_failure={dominant}",
+                f"breakdown={breakdown}",
+            ],
+            [f"针对 {dominant} 类失败增加重试或替代路径", "验证工具失败不会阻断主回复"],
         ))
     if int(metrics.get("reflection_count") or 0) <= 0:
         tasks.append(_task(
