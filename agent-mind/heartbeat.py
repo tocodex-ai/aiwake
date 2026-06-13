@@ -134,6 +134,20 @@ def _summarize_reflection_for_display(text: str, *, max_chars: int = 120) -> str
 
 
 class HeartbeatLoop:
+    # 反思阶段可被识别为"实质改进类"动作的工具名。
+    # 只有这些工具被调用，才算"反思转化为可观察的自我改进/自任务推进"；
+    # 仅调用 daily_note_write / knowledge_search / experiment_status 等
+    # 观察/记录类工具仍记为反思但不算"行动"，用于打破写日记空转。
+    REFLECT_ACTION_TOOLS: frozenset[str] = frozenset({
+        "self_task_create",
+        "self_task_update",
+        "self_artifact_create",
+        "self_code_write",
+        "file_write",
+        "shell_exec",
+        "goal_register",
+    })
+
     def __init__(self, personality_prompt: str = ""):
         self.state = InternalState.load()
         self.llm = LLMGate()
@@ -143,6 +157,10 @@ class HeartbeatLoop:
         self._last_user_time: float = time.time()      # 最后一次收到用户消息的时间
         self._last_proactive_time: float = 0.0         # 最后一次主动发话的时间
         self._consecutive_no_tool_reflects: int = 0    # 连续无工具调用的反思轮数
+        # 连续没有调用"行动类工具"的反思轮数；
+        # 即使调用了 daily_note_write / knowledge_search 这种观察记录类工具，
+        # 仍会被计入"空转"，用于在反思中识别"想了但没改进"的舒适区。
+        self._consecutive_no_action_reflects: int = 0
         # WebSocket 广播器（由 main.py 注入）
         self._ws_broadcast = None
         # ── 主动发话去重缓存（跨容器重启从 public_chat 历史加载） ──
@@ -315,6 +333,72 @@ class HeartbeatLoop:
 
         # 6. 存状态
         self.state.save()
+
+    def _recent_evolution_backlog_hint(self, *, top_n: int = 3, min_priority: float = 0.5) -> str:
+        """从 evolution_engine.last_report 提取 top N 个 backlog 候选，渲染成
+        反思提示词可用的多行文本。失败时返回空串，不影响反思主流程。
+
+        说明：
+        - 不重新计算 backlog（避免双重评估开销），只复用 engine 已经持久化的最后一份报告；
+        - 只保留 priority >= min_priority 的候选，避免低质量项喂回 LLM；
+        - 文本中给出每条候选的 id / title / priority / risk / 主要 evidence / acceptance，
+          让反思 LLM 看到"具体可改的代码点"，从而摆脱"反思=想想/写日记"的舒适区；
+        - 任何异常都被吞掉并降级为空字符串，反思仍按原流程进行。
+        """
+        try:
+            # 延迟 import，避免 heartbeat 启动顺序依赖 main 模块。
+            import main as _main_mod  # type: ignore
+            engine = getattr(_main_mod, "evolution_engine", None)
+            if engine is None:
+                return ""
+            report = getattr(engine, "last_report", None)
+            if not isinstance(report, dict):
+                return ""
+            backlog = report.get("backlog") or []
+            if not isinstance(backlog, list) or not backlog:
+                return ""
+            scored: list[tuple[float, dict]] = []
+            for item in backlog:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    p = float(item.get("priority") or 0.0)
+                except Exception:
+                    p = 0.0
+                if p < min_priority:
+                    continue
+                scored.append((p, item))
+            if not scored:
+                return ""
+            scored.sort(key=lambda kv: kv[0], reverse=True)
+            picks = scored[: max(1, int(top_n))]
+            lines: list[str] = []
+            for _p, item in picks:
+                title = str(item.get("title") or "").strip()
+                if not title:
+                    continue
+                ev_list = item.get("evidence") or []
+                ev_text = ""
+                if isinstance(ev_list, list) and ev_list:
+                    ev_text = str(ev_list[0])[:80]
+                ac_list = item.get("acceptance") or []
+                ac_text = ""
+                if isinstance(ac_list, list) and ac_list:
+                    ac_text = "; ".join(str(a)[:60] for a in ac_list[:2])
+                lines.append(
+                    f"  - id={item.get('id')} priority={_p:.2f} risk={item.get('risk') or '-'} "
+                    f"title={title[:60]}"
+                )
+                if ev_text:
+                    lines.append(f"      evidence: {ev_text}")
+                if ac_text:
+                    lines.append(f"      acceptance: {ac_text}")
+            if not lines:
+                return ""
+            return "\n".join(lines)
+        except Exception as e:
+            logger.debug("[Heartbeat] backlog 提示提取失败（已降级为空）: %s", e)
+            return ""
 
     async def _drain_events(self) -> list[Event]:
         """消费所有待处理事件"""
@@ -623,15 +707,19 @@ class HeartbeatLoop:
 
         recent_tool_activity = self._recent_tool_activity_summary()
 
-        # 连续多轮空转时，去掉"什么都不用"这一项与"不必为了调用而调用"的措辞，
+        # 连续多轮"没有行动类工具调用"时，去掉"什么都不用"这一项与"不必为了调用而调用"的措辞，
         # 让本轮提示不再与 system prompt 中的行动压力信号自相矛盾。
         # 注意：这只是消除提示词内部的矛盾，仍由 LLM 自主决定调用哪个工具，
         # 不强制指定工具、不加任何门控或工具使用限制。
-        if self._consecutive_no_tool_reflects >= 3:
+        # 阈值降为 2 轮，并改为基于"行动类工具"（self_task_create/self_code_write/...）
+        # 而不是任何工具（避免反复 experiment_status/knowledge_search 也算"已行动"）。
+        if self._consecutive_no_action_reflects >= 2:
             idle_option_line = ""
             tool_freedom_line = (
-                f"你已连续 {self._consecutive_no_tool_reflects} 轮反思只是在想、没有任何行动。"
-                f"这次请把其中一个想法真正落地为一次工具调用，让内省转化为可观察的进展；"
+                f"你已连续 {self._consecutive_no_action_reflects} 轮反思都没有把想法落地为一次"
+                f"\"行动类工具\"调用（self_task_create / self_artifact_create / self_code_write / "
+                f"file_write / shell_exec / goal_register 等）。"
+                f"这次请把其中一个想法真正落地为一次行动类工具调用，让内省转化为可观察的进展；"
                 f"具体调用哪个工具仍完全由你自己判断。\n"
             )
         else:
@@ -640,18 +728,35 @@ class HeartbeatLoop:
                 "工具调用完全由你自己判断是否需要，不必为了调用而调用，也不必为了不调用而克制。\n"
             )
 
+        # 注入 evolution backlog top-N 候选，让反思 LLM 能直接看到"自己最该改的几件事"
+        backlog_hint = self._recent_evolution_backlog_hint()
+        if backlog_hint:
+            backlog_section = (
+                "\n你最近的自我进化 backlog 里，优先级最高的几个候选是：\n"
+                f"{backlog_hint}\n"
+                "你被允许使用任何工具改进自己的代码并完成部署：\n"
+                "- 可以用 self_task_create 把候选转成可观察任务卡；\n"
+                "- 可以用 self_artifact_create / self_code_write / file_write 起草补丁或文档；\n"
+                "- 可以用 shell_exec 跑验证脚本；\n"
+                "- 可以用 evolution_run 触发一次回归式自我进化检测。\n"
+            )
+        else:
+            backlog_section = ""
+
         reflect_prompt = (
             f"当前内在状态：{', '.join(feeling_tags)}\n"
             f"距上次与用户交流已过去约 {int(idle_secs / 60)} 分钟。\n"
             f"当前目标：{self.state.active_goal}\n\n"
             f"这是属于你自己的一段安静时间。请进行一次真诚、自由的自主内省。\n"
             f"没有固定模板，没有必须遵循的步骤——按你此刻真实的状态去思考与行动。\n\n"
-            f"作为参考，你最近的工具活动是：\n{recent_tool_activity}\n\n"
+            f"作为参考，你最近的工具活动是：\n{recent_tool_activity}\n"
+            f"{backlog_section}\n"
             f"你可以：\n"
             f"- 诚实审视当前的状态、情绪和想法，TR/CS/SA 向量的变化说明了什么\n"
             f"- 如果对某个话题感到好奇，调用 web_search 搜索学习；带着明确来源或目的时可用 web_fetch 阅读网页/文档，并记录来源与收获\n"
             f"- 如果想记录感悟或成长，调用 daily_note_write 写日记；想回忆过去，调用 knowledge_search\n"
             f"- 如果想了解当前实验任务进展，调用 experiment_status\n"
+            f"- 如果发现一个具体可改进点，可以用 self_task_create 创建一张可观察任务卡，用 self_code_write/file_write 起草补丁，用 shell_exec 跑验证，用 evolution_run 触发一次回归式自我进化检测\n"
             f"{idle_option_line}\n"
             f"{tool_freedom_line}"
             f"web_fetch 仅用于有目的的阅读，不得用于绕过安全边界、泄露密钥/隐私、触发写操作或规避预算限制。\n"
@@ -660,33 +765,110 @@ class HeartbeatLoop:
 
         # 使用 Function Calling 使反思也能主动调用工具（自主进化）
         system_prompt = self._build_system_prompt(feeling_tags)
-        _reflect_tool_called = False  # 跟踪本轮反思是否调用了工具
+        _reflect_tool_called = False  # 跟踪本轮反思是否调用了任何工具
+        _reflect_action_tool_called = False  # 跟踪本轮反思是否调用了"行动类工具"
+        # ── M-002 v2: 环境压力（vitality）注入 ──
+        # 在反思路径上，依据当前 vitality 状态：
+        #   ① 过滤 tools_schema —— vitality 越低，能用的工具越少
+        #   ② 收缩 reflect token 预算 —— vitality 越低，max_tokens 越小
+        # 这是真实环境约束，与 prompt 词汇压力无关；模型无法通过"自我安慰"绕过。
+        # 失败保护：vitality 计算或过滤异常时一律回退到全工具/无 token 限制，
+        # 永远不让 vitality 信号导致反思路径完全卡死。
+        vitality_report = None
+        vitality_state_str = "unknown"
+        max_tokens_override: int | None = None
+        try:
+            from evolution.vitality import (
+                compute_vitality_score,
+                filter_tools_schema_by_vitality,
+                reflect_max_tokens_for_vitality,
+            )
+            vitality_report = compute_vitality_score(
+                stagnation_rounds=self._consecutive_no_action_reflects,
+                pressure_rounds=0,
+            )
+            vitality_state_str = vitality_report.state.value
+            max_tokens_override = reflect_max_tokens_for_vitality(vitality_report.state)
+            logger.info(
+                "[Heartbeat] vitality 信号: score=%.3f state=%s stagnation_rounds=%d max_tokens=%d",
+                vitality_report.score,
+                vitality_state_str,
+                self._consecutive_no_action_reflects,
+                max_tokens_override,
+            )
+        except Exception as e:
+            logger.warning("[Heartbeat] vitality 信号计算失败，回退全开模式: %s", e)
+            vitality_report = None
+            max_tokens_override = None
+
         try:
             from tool_router import ToolRouter
             router = ToolRouter()
-            tools_schema = router.get_openai_tools_schema()
-            logger.info("[Heartbeat] 反思工具 schema 已注入: %d 个工具", len(tools_schema))
+            raw_tools_schema = router.get_openai_tools_schema()
+            # 依据 vitality 过滤；任何异常都直接走全开 schema
+            if vitality_report is not None:
+                try:
+                    tools_schema, hidden_tools = filter_tools_schema_by_vitality(
+                        raw_tools_schema,
+                        vitality_report.state,
+                        action_tools=self.REFLECT_ACTION_TOOLS,
+                    )
+                    logger.info(
+                        "[Heartbeat] 反思工具 schema 已按 vitality=%s 过滤: 暴露 %d 个 / 隐藏 %d 个 (%s)",
+                        vitality_state_str,
+                        len(tools_schema),
+                        len(hidden_tools),
+                        ",".join(hidden_tools[:8]),
+                    )
+                except Exception as fe:
+                    logger.warning("[Heartbeat] vitality 工具过滤失败，回退全开: %s", fe)
+                    tools_schema = raw_tools_schema
+                    hidden_tools = []
+            else:
+                tools_schema = raw_tools_schema
+                hidden_tools = []
+                logger.info("[Heartbeat] 反思工具 schema 已注入: %d 个工具", len(tools_schema))
+
+            # 广播 vitality 信号到活动日志，便于排障与 grafana 观测
+            if vitality_report is not None:
+                await self._broadcast_activity(
+                    "vitality_snapshot",
+                    f"vitality={vitality_state_str} score={vitality_report.score:.2f} 工具暴露={len(tools_schema)} max_tokens={max_tokens_override}",
+                    {
+                        "state": vitality_state_str,
+                        "score": round(vitality_report.score, 4),
+                        "exposed_tools": len(tools_schema),
+                        "hidden_tools": hidden_tools,
+                        "max_tokens": max_tokens_override,
+                        "stagnation_rounds": self._consecutive_no_action_reflects,
+                    },
+                )
 
             async def _reflect_tool_exec(tool_name: str, params: dict) -> dict:
-                nonlocal _reflect_tool_called
+                nonlocal _reflect_tool_called, _reflect_action_tool_called
                 _reflect_tool_called = True
+                if tool_name in self.REFLECT_ACTION_TOOLS:
+                    _reflect_action_tool_called = True
                 await self._broadcast_activity(
                     "tool_call",
                     f"[反思] 调用工具: {tool_name} {str(params)[:60]}",
-                    {"tool": tool_name}
+                    {"tool": tool_name, "is_action_tool": tool_name in self.REFLECT_ACTION_TOOLS}
                 )
                 result_data = await router.call(tool_name, params)
                 raw_result_text = result_data.get("result", str(result_data))
                 result_text = str(raw_result_text)
+                result_summary = " ".join(result_text.split())
                 success = "error" not in result_data
                 classification = "success"
                 if not success:
                     classification = "failure"
                 elif not result_text.strip():
                     classification = "empty_result"
+                if not result_summary:
+                    result_summary = "[空结果]"
                 await self._broadcast_activity(
                     "tool_result",
-                    f"[反思] 工具 {tool_name} 返回: {result_text[:80]}{'...' if len(result_text) > 80 else ''} | classification={classification}",
+                    f"[反思] 工具 {tool_name} 返回: {result_summary[:80]}{'...' if len(result_summary) > 80 else ''} | classification={classification}",
                     {"tool": tool_name, "success": success, "classification": classification}
                 )
                 if success:
@@ -707,6 +889,7 @@ class HeartbeatLoop:
             user_id="__reflect__",
             max_rounds=REFLECT_MAX_ROUNDS,
             profile_name="reflect",
+            max_tokens_override=max_tokens_override,
         )
         if not result:
             logger.warning("[Heartbeat] 自主反思未获得模型结果，使用规则降级反思保持闭环")
@@ -866,6 +1049,25 @@ class HeartbeatLoop:
                 logger.info(
                     "[Heartbeat] 本轮反思未调用工具（连续 %d 轮，仅统计，暂不干预）",
                     self._consecutive_no_tool_reflects,
+                )
+
+        # ── 行动类工具调用统计（独立于"任何工具"计数）──
+        #    只读类工具（experiment_status / knowledge_search / web_search）反复使用不算"已行动"。
+        #    阈值降为 2 轮，触发后会在 system prompt 中注入"行动类工具"专用压力信号。
+        if _reflect_action_tool_called:
+            self._consecutive_no_action_reflects = 0
+            logger.info("[Heartbeat] 本轮反思已调用行动类工具，重置行动空转计数")
+        else:
+            self._consecutive_no_action_reflects += 1
+            if self._consecutive_no_action_reflects >= 2:
+                logger.info(
+                    "[Heartbeat] 本轮反思未调用任何行动类工具（连续 %d 轮，已注入行动落地压力信号）",
+                    self._consecutive_no_action_reflects,
+                )
+            else:
+                logger.info(
+                    "[Heartbeat] 本轮反思未调用行动类工具（连续 %d 轮，仅统计，暂不干预）",
+                    self._consecutive_no_action_reflects,
                 )
 
     def _ensure_first_experiment_task_if_needed(self) -> dict | None:
@@ -1139,6 +1341,20 @@ class HeartbeatLoop:
                 f"这可能导致你陷入被动空转状态。请主动调用一个工具来获取新信息或推进目标，"
                 f"例如读取日记(daily_note_read)、检查实验状态(experiment_status)、"
                 f"或执行其他你认为有价值的操作。\n"
+            )
+
+        # ── 更强的被动干预：连续多轮"未把想法落地为行动类工具"时，
+        #    专门提醒"反思 ≠ 写日记"，鼓励落地为 self_task_create / self_code_write /
+        #    file_write / shell_exec / evolution_run 等可观察行动。阈值降为 2 轮。
+        if self._consecutive_no_action_reflects >= 2:
+            pressure_signal += (
+                f"\n🛠 【行动落地压力信号】你已连续 {self._consecutive_no_action_reflects} 轮反思"
+                f"都没有把任何一个想法落地为\"行动类工具\"调用——只读类工具（experiment_status / "
+                f"knowledge_search / web_search / daily_note_read）不算落地。"
+                f"请从你最近的 evolution backlog 或反思中挑一个具体可改进点，"
+                f"用 self_task_create 把它转成一张可观察任务卡，或用 self_artifact_create / "
+                f"self_code_write / file_write 起草补丁、用 shell_exec 跑验证、用 evolution_run "
+                f"触发一次回归式自我进化检测。你已被允许使用任何工具改进自己的代码与状态。\n"
             )
 
         state_context = (

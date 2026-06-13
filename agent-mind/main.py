@@ -446,11 +446,20 @@ def _looks_like_mojibake_output(text: str) -> bool:
     return cjk_count == 0 and marker_hits >= 4 and latin1_mojibake_ratio >= 0.08
 
 
-def _safe_chat_fallback_reply(user_message: str) -> str:
-    """当上游输出疑似乱码时给出安全、可读、可验证的中文降级回复。"""
+def _safe_chat_fallback_reply(user_message: str, reason: str = "mojibake") -> str:
+    """当上游输出异常时给出安全、可读、可验证的中文降级回复。
+
+    reason="mojibake"：上游输出疑似乱码，触发编码安全降级；
+    reason="empty"：上游模型没有返回有效文本（常见原因是 work API 配额/速率限制），
+    必须如实归因，避免把"配额耗尽"误标成"编码损坏"污染公开聊天与训练证据链。
+    """
     # 使用 ASCII 源码级 Unicode 转义拼装中文，避免部署链路或容器默认编码异常时，
     # 连安全降级文本本身也被编码污染。
-    prefix = "\u6211\u68c0\u6d4b\u5230\u672c\u8f6e\u4e0a\u6e38\u6a21\u578b\u8f93\u51fa\u7591\u4f3c\u7f16\u7801\u635f\u574f\uff0c\u4e3a\u907f\u514d\u628a\u4e71\u7801\u5199\u5165\u516c\u5f00\u8bb0\u5fc6\uff0c"
+    if reason == "empty":
+        # "本轮上游模型没有返回有效文本（可能是调用配额或速率限制），为保持记录可信，"
+        prefix = "\u672c\u8f6e\u4e0a\u6e38\u6a21\u578b\u6ca1\u6709\u8fd4\u56de\u6709\u6548\u6587\u672c\uff08\u53ef\u80fd\u662f\u8c03\u7528\u914d\u989d\u6216\u901f\u7387\u9650\u5236\uff09\uff0c\u4e3a\u4fdd\u6301\u8bb0\u5f55\u53ef\u4fe1\uff0c"
+    else:
+        prefix = "\u6211\u68c0\u6d4b\u5230\u672c\u8f6e\u4e0a\u6e38\u6a21\u578b\u8f93\u51fa\u7591\u4f3c\u7f16\u7801\u635f\u574f\uff0c\u4e3a\u907f\u514d\u628a\u4e71\u7801\u5199\u5165\u516c\u5f00\u8bb0\u5fc6\uff0c"
     topic = (user_message or "").strip().replace("\n", " ")[:80]
     if topic:
         return (
@@ -507,14 +516,22 @@ def _is_explicit_self_task_update_request(text: str) -> bool:
 
 
 def _extract_labeled_prompt_value(text: str, label: str, *, default: str = "") -> str:
-    """从训练提示中提取 title=... / goal=... 这类显式字段，避免确定性工具误用旧硬编码任务。"""
+    """从训练提示中提取 title=... / goal=... 及中文标签值，避免确定性工具误用旧硬编码任务。"""
     import re as _re
 
-    pattern = rf"(?:^|[\n，,；;。])\s*{_re.escape(label)}\s*[=:：]\s*(?P<value>.*?)(?=(?:[\n，,；;。]\s*(?:title|goal|status|note|done_when|安全边界|短答)\s*[=:：])|\Z)"
+    label_aliases = {
+        "title": ("title", "标题", "标题建议"),
+        "goal": ("goal", "目标", "done_when", "完成条件"),
+        "status": ("status", "状态"),
+        "note": ("note", "备注"),
+    }.get(label, (label,))
+    label_pattern = "|".join(_re.escape(alias) for alias in label_aliases)
+    stop_pattern = "title|goal|status|note|done_when|安全边界|短答|标题|标题建议|目标|完成条件|备注"
+    pattern = rf"(?:^|[\n，,；;。])\s*(?:{label_pattern})\s*(?:必须是|建议)?\s*[=:：]\s*(?P<value>.*?)(?=(?:[\n，,；;。]\s*(?:{stop_pattern})\s*(?:必须是|建议)?\s*[=:：])|\Z)"
     match = _re.search(pattern, text or "", _re.S | _re.I)
     if not match:
         return default
-    value = " ".join(match.group("value").strip().split())
+    value = " ".join(match.group("value").strip().strip("`'\"").split())
     return value or default
 
 
@@ -568,7 +585,11 @@ async def _run_deterministic_self_learning_tool(user_message: str, tool_executor
         return reply, "deterministic:self_task_update"
 
     if "self_task_create" in msg_lower and ("open_task_count=0" in msg_lower or "调用 self_task_create" in msg_text or "优先调用 self_task_create" in msg_text):
-        title = _extract_labeled_prompt_value(msg_text, "title", default="短消息下避免空输出降级并保留工具证据")
+        title = _extract_labeled_prompt_value(
+            msg_text,
+            "title",
+            default="短消息下避免空输出降级并保留工具证据",
+        )
         goal = _extract_labeled_prompt_value(
             msg_text,
             "goal",
@@ -856,15 +877,16 @@ async def chat(req: ChatRequest, request: Request):
         if _acquired_chat and _busy_current is not None:
             _chat_task_id = _busy_current.task_id
         else:
-            _chat_readonly_mode = True
+            # 不因并发自任务限制工具；只记录当前忙碌状态，仍允许 AIwake 自主完成闭环。
+            _chat_readonly_mode = False
             _busy_current_payload = (
                 _busy_current.to_public() if _busy_current is not None else None
             )
             try:
                 if heartbeat:
                     await heartbeat._broadcast_activity(
-                        "chat_readonly_mode",
-                        "AIwake 当前正忙于自任务，本轮 /chat 进入只读模式。",
+                        "chat_concurrent_mode",
+                        "AIwake 当前正忙于自任务，本轮 /chat 仍保留完整工具能力。",
                         {"busy": _busy_current_payload or {}},
                     )
             except Exception:
@@ -1003,9 +1025,9 @@ async def chat(req: ChatRequest, request: Request):
                         "并用 /activity_logs?q=self_task_update 验证 tool_call/tool_result。"
                     )
                 else:
-                    reply = _safe_chat_fallback_reply(req.message)
+                    reply = _safe_chat_fallback_reply(req.message, reason="empty")
             else:
-                reply = _safe_chat_fallback_reply(req.message)
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
         elif "self_task_create" in msg_lower and ("open_task_count=0" in msg_lower or "调用 self_task_create" in msg_text or "优先调用 self_task_create" in msg_text):
             title = _extract_labeled_prompt_value(msg_text, "title", default="短消息下避免空输出降级并保留工具证据")
             goal = _extract_labeled_prompt_value(
@@ -1027,7 +1049,7 @@ async def chat(req: ChatRequest, request: Request):
                     "并用 /activity_logs?q=self_task_create 验证 tool_call/tool_result。"
                 )
             else:
-                reply = _safe_chat_fallback_reply(req.message)
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
         elif explicit_artifact_request and "latest_task" in msg_lower:
             task_id = _extract_self_artifact_task_id(msg_text)
             if task_id:
@@ -1069,11 +1091,11 @@ async def chat(req: ChatRequest, request: Request):
                         "并用 /activity_logs?q=self_artifact_create 验证 tool_call/tool_result。"
                     )
                 else:
-                    reply = _safe_chat_fallback_reply(req.message)
+                    reply = _safe_chat_fallback_reply(req.message, reason="empty")
             else:
-                reply = _safe_chat_fallback_reply(req.message)
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
         else:
-            reply = _safe_chat_fallback_reply(req.message)
+            reply = _safe_chat_fallback_reply(req.message, reason="empty")
     if _looks_like_mojibake_output(reply):
         logger.warning(
             "[Chat] LLM 输出疑似乱码，触发安全降级: tier=%s len=%d sample=%r",
@@ -1246,6 +1268,31 @@ async def growth_milestones(
 ):
     """只读查看成长节点与曲线图数据；默认近30天。"""
     return growth_chart_data(days=days)
+
+
+@app.get("/vitality/status")
+async def vitality_status():
+    """M-002 v2 只读：当前 vitality 快照（环境压力面板）。
+
+    返回当前 vitality_score、状态档位（vibrant/stable/drifting/fading/critical）、
+    各项贡献、反思 token 预算、被收窄的工具集等。用于运维观测、A/B 验证、
+    以及前端可视化"AIwake 的当前生命力面板"。
+
+    完全只读、不传敏感信息、不应用任何副作用。
+    """
+    try:
+        from evolution.vitality import vitality_status_snapshot
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)}
+    stagnation_rounds = 0
+    if heartbeat is not None:
+        stagnation_rounds = int(getattr(heartbeat, "_consecutive_no_action_reflects", 0) or 0)
+    snap = vitality_status_snapshot(stagnation_rounds=stagnation_rounds)
+    snap["runtime"] = {
+        "heartbeat_ready": heartbeat is not None,
+        "stagnation_rounds_source": "heartbeat._consecutive_no_action_reflects",
+    }
+    return snap
 
 
 @app.get("/goal/list")

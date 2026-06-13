@@ -274,13 +274,32 @@ def _build_prompt(
         "evaluation": evaluation,
         "external_learning": external_learning or {},
     }
+    recovery = metrics.get("failure_recovery_playbook") or {}
+    recovery_lines = ""
+    if isinstance(recovery, dict) and recovery.get("rules"):
+        parts = []
+        for r in recovery["rules"][:6]:
+            parts.append(
+                f"  - {r.get('category')}(x{r.get('count')}): 首选={r.get('first_action')}; "
+                f"兜底={r.get('fallback')}; 停止={r.get('stop_when')}"
+            )
+        recovery_lines = (
+            "\n── 工具失败恢复决策表（已按实际失败画像生成，直接引用，不要再从零推演）──\n"
+            + "\n".join(parts)
+            + f"\n  原则：{recovery.get('principle', '')}\n"
+            + "Builder 在提 proposed_next_actions 时，应直接采纳上表对应类别的"
+            + "首选/兜底/停止规则，并对每次失败补三元证据（失败类型/恢复动作/恢复结果）；"
+            + "若同类失败第二次仍走同样弯路，视为闭环失效，优先修正规则而非增加泛化反思。\n"
+        )
+
     return (
         "请让 AIwake 与自己进行一轮真实的内部进化检测对话。\n"
         "角色一 Critic：指出当前自我学习/自我进化闭环的最大缺陷。\n"
         "角色二 Builder：提出下一步最小可验证改进。\n"
         "最后输出：detected_risks 与 proposed_next_actions。\n"
         "如果 external_learning 有内容，请说明来源如何用于当前目标，以及仍不确定之处。\n"
-        "不要声称已经修改代码，不要请求危险工具。\n\n"
+        "不要声称已经修改代码，不要请求危险工具。\n"
+        f"{recovery_lines}\n"
         "── 可用的内部工具（改→度量→收敛 闭环）──\n"
         "你可以在 proposed_next_actions 中以下列协议显式登记一个可度量目标，evolution\n"
         "引擎下一轮起会自动复测、达成自动闭合并沉淀进能力库；恶化或超限自动放弃。\n"

@@ -45,13 +45,28 @@ class ExperimentStore:
             return []
         max_items = max(1, min(int(limit or 100), 1000))
         items: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in self._read_tail_lines(path, max_items=max_items):
             try:
                 item = json.loads(line)
             except Exception:
                 continue
             items.append(redact_secrets(item))
         return items[-max_items:]
+
+    def _read_tail_lines(self, path: Path, *, max_items: int, max_bytes: int = 1024 * 1024) -> list[str]:
+        """Read the end of an append-only JSONL file without loading old history."""
+        try:
+            size = path.stat().st_size
+            if size <= max_bytes:
+                return path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            with open(path, "rb") as f:
+                f.seek(max(0, size - max_bytes))
+                f.readline()
+                data = f.read()
+            lines = data.decode("utf-8", errors="ignore").splitlines()
+            return lines[-max_items * 3 :]
+        except Exception:
+            return []
 
     def _effective_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """按任务 id 折叠 append-only 任务事件，识别 self_task_update 的最新状态。"""
@@ -85,10 +100,22 @@ class ExperimentStore:
         events = self.read("events", limit=1000)
         closed_statuses = {"done", "closed", "cancelled", "failed"}
         open_tasks = [t for t in effective_tasks if t.get("status") not in closed_statuses]
+        # 为每个 open task 生成精简摘要，暴露 id/title/status/goal 供 agent 自主管理
+        open_tasks_summary = [
+            {
+                "id": t.get("id", ""),
+                "title": t.get("title", ""),
+                "status": t.get("status", "open"),
+                "goal": (t.get("goal") or "")[:200],
+                "created_at": t.get("created_at", ""),
+            }
+            for t in open_tasks
+        ]
         return redact_secrets({
             "task_count": len(effective_tasks),
             "task_event_count": len(tasks),
             "open_task_count": len(open_tasks),
+            "open_tasks": open_tasks_summary,
             "artifact_count": len(artifacts),
             "tool_call_count": len(tool_calls),
             "reflection_count": len(reflections),

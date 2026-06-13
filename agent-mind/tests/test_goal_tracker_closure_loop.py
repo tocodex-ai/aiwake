@@ -198,6 +198,57 @@ def main() -> None:
         )
         assert ga["id"] != gb["id"], "重复登记应产生不同 goal_id"
 
+        # ── Case 5b: trivial 目标（登记即达标）应 abandoned，绝不闭合刷分 ──
+        # 方向 up：现状已远超目标（baseline=27 >= target=1）
+        caps_before = len(read_capabilities(limit=100))
+        ms_before = _read_jsonl(milestones_file)
+        closed_before = sum(1 for m in ms_before if m.get("event_type") == "goal_closed")
+        cap_reg_before = sum(1 for m in ms_before if m.get("event_type") == "capability_registered")
+
+        g_trivial_up = register_goal(
+            metric="proactive_count",
+            direction="up",
+            target=1,
+            description="伪目标：现状27已远超目标1（应被如实放弃）",
+            source="manual",
+            max_cycles=4,
+        )
+        r_tu = evaluate_open_goals({"proactive_count": 27})
+        match_tu = [r for r in r_tu if r.get("goal_id") == g_trivial_up["id"]]
+        assert match_tu and match_tu[0]["status"] == "abandoned", \
+            f"登记即达标(up)应 abandoned，实为 {match_tu and match_tu[0]['status']}"
+
+        # 方向 down：现状已低于目标（baseline=2 <= target=10）
+        g_trivial_down = register_goal(
+            metric="tool_failure_count",
+            direction="down",
+            target=10,
+            description="伪目标：现状2已低于目标10（应被如实放弃）",
+            source="manual",
+            max_cycles=4,
+        )
+        r_td = evaluate_open_goals({"tool_failure_count": 2})
+        match_td = [r for r in r_td if r.get("goal_id") == g_trivial_down["id"]]
+        assert match_td and match_td[0]["status"] == "abandoned", \
+            f"登记即达标(down)应 abandoned，实为 {match_td and match_td[0]['status']}"
+
+        # 伪目标绝不能沉淀能力，也不能记 goal_closed / capability_registered
+        caps_after = len(read_capabilities(limit=100))
+        assert caps_after == caps_before, "伪目标不得写入能力库刷分"
+        ms_after = _read_jsonl(milestones_file)
+        closed_after = sum(1 for m in ms_after if m.get("event_type") == "goal_closed")
+        cap_reg_after = sum(1 for m in ms_after if m.get("event_type") == "capability_registered")
+        assert closed_after == closed_before, "伪目标不得记 goal_closed 刷分"
+        assert cap_reg_after == cap_reg_before, "伪目标不得记 capability_registered 刷分"
+        # 应如实记录为 trivial_target 放弃
+        trivial_abandons = [
+            m for m in ms_after
+            if m.get("event_type") == "goal_abandoned"
+            and (m.get("extra") or {}).get("reason") == "trivial_target"
+        ]
+        assert len(trivial_abandons) >= 2, \
+            f"应记录至少 2 条 trivial_target 放弃里程碑，实为 {len(trivial_abandons)}"
+
         # ── Case 6: read_open_goals 不应再返回已闭合 / 已放弃的目标 ──
         opens = read_open_goals()
         open_ids = {g["id"] for g in opens}

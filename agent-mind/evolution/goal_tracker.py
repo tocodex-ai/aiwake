@@ -201,6 +201,27 @@ def _convergence_judgment(
     return False, "未知方向"
 
 
+def _is_trivial_target(
+    baseline: float,
+    target: float,
+    direction: str,
+    tolerance: float = 0.001,
+) -> bool:
+    """判断目标在设定基线时是否已经被满足（伪目标）。
+
+    例如 direction='up'、baseline=27、target=1：登记当下现状已远超目标，
+    这种目标没有"改 → 度量 → 收敛"的意义，下一轮会被立即判定 closed 并
+    发放 goal_closed / capability_registered 奖励，等于刷分自欺。应在设定
+    基线时就识别出来并如实放弃（trivial_target），而不是闭合刷分。
+    """
+    if direction == "up":
+        return baseline >= target - tolerance
+    if direction == "down":
+        return baseline <= target + tolerance
+    # direction == "target"
+    return abs(baseline - target) <= tolerance
+
+
 def _should_abandon(current: float, baseline: float, direction: str) -> tuple[bool, str]:
     """Check if the current value is significantly worse than baseline."""
     if baseline == 0:
@@ -336,10 +357,49 @@ def _evaluate_one(goal: dict[str, Any], metrics: dict[str, Any]) -> dict[str, An
         baseline = current
         goal["baseline"] = baseline
         goal["baseline_at"] = now
-        # Persist baseline update
         goal["cycle_count"] = cycle_count + 1
         goal["last_measurement"] = current
         goal["last_measured_at"] = now
+
+        # 伪目标防护：若登记当下现状就已满足目标，说明这不是"改→度量→收敛"
+        # 的真目标。如实判定 abandoned(trivial_target)，绝不闭合刷取 goal_closed
+        # / capability_registered 奖励，避免自欺式刷分。
+        if _is_trivial_target(baseline, target, direction):
+            goal["status"] = "abandoned"
+            goal["closed_at"] = now
+            goal["closed_reason"] = (
+                f"登记时现状 {baseline:.4f} 已满足目标 {target}（方向：{direction}），"
+                f"属于无收敛意义的伪目标，如实放弃，不计入成长奖励"
+            )
+            _append_goal(goal)
+            try:
+                record_growth_milestone(
+                    event_type="goal_abandoned",
+                    description=f"目标自动放弃（伪目标）: {goal.get('description', '')[:200]}",
+                    extra={
+                        "goal_id": gid,
+                        "metric": metric,
+                        "baseline": str(baseline),
+                        "current": str(current),
+                        "target": str(target),
+                        "cycles": str(goal["cycle_count"]),
+                        "reason": "trivial_target",
+                    },
+                )
+            except Exception:
+                pass
+            return {
+                "goal_id": gid,
+                "status": "abandoned",
+                "metric": metric,
+                "baseline": baseline,
+                "current": current,
+                "target": target,
+                "cycle_count": goal["cycle_count"],
+                "reason": goal["closed_reason"],
+            }
+
+        # Persist baseline update
         _append_goal(goal)
         return {
             "goal_id": gid,
@@ -355,6 +415,44 @@ def _evaluate_one(goal: dict[str, Any], metrics: dict[str, Any]) -> dict[str, An
     goal["cycle_count"] = cycle_count
     goal["last_measurement"] = current
     goal["last_measured_at"] = now
+
+    # 伪目标防护（存量目标）：若基线本身已满足目标，说明这是登记即达标的
+    # 伪目标。即使它已过 baseline_set 阶段，也不应在收敛判定中被判 closed
+    # 刷取 goal_closed / capability_registered 奖励，而应如实放弃。
+    if _is_trivial_target(float(baseline), target, direction):
+        goal["status"] = "abandoned"
+        goal["closed_at"] = now
+        goal["closed_reason"] = (
+            f"基线 {float(baseline):.4f} 在登记时即已满足目标 {target}（方向：{direction}），"
+            f"属于无收敛意义的伪目标，如实放弃，不计入成长奖励"
+        )
+        _append_goal(goal)
+        try:
+            record_growth_milestone(
+                event_type="goal_abandoned",
+                description=f"目标自动放弃（伪目标）: {goal.get('description', '')[:200]}",
+                extra={
+                    "goal_id": gid,
+                    "metric": metric,
+                    "baseline": str(baseline),
+                    "current": str(current),
+                    "target": str(target),
+                    "cycles": str(cycle_count),
+                    "reason": "trivial_target",
+                },
+            )
+        except Exception:
+            pass
+        return {
+            "goal_id": gid,
+            "status": "abandoned",
+            "metric": metric,
+            "baseline": baseline,
+            "current": current,
+            "target": target,
+            "cycle_count": cycle_count,
+            "reason": goal["closed_reason"],
+        }
 
     # Check auto-abandon (significantly worse than baseline)
     abandon, abandon_reason = _should_abandon(current, baseline, direction)

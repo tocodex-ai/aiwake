@@ -295,6 +295,19 @@ def _is_tool_failure(content: str) -> bool:
 # 失败画像，使进化 backlog 能生成差异化提案，避免 NO_PATCH 空循环。
 _FAILURE_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("rate_limited", ("429", "rate limit", "too many requests", "频率", "限流")),
+    # config_blocked / not_found 必须排在 forbidden 之前：这两类是“确定性失败”，
+    # 重试同样的工具名/路径永远不会成功，应给出“不要重试、改名/换工具/确认存在”的
+    # 止损指引，避免被笼统计入 other_error 后又按“原样重试一次”空转，长期卡住
+    # tool_failure_count 不收敛（线上证据：Glob/Read/TodoWrite 未被实验配置允许、
+    # file_read 文件不存在，反复出现却始终归到 other_error）。
+    ("config_blocked", (
+        "未被当前实验配置允许", "未被当前实验", "未被允许", "not allowed",
+        "not permitted", "disabled", "已禁用", "未配置", "未注册",
+    )),
+    ("not_found", (
+        "不存在", "not found", "no such file", "找不到", "未找到",
+        "does not exist", "404",
+    )),
     ("forbidden", ("403", "forbidden", "unauthorized", "401", "无权", "拒绝访问")),
     ("upstream_error", ("521", "522", "523", "502", "503", "504", "bad gateway", "gateway")),
     ("timeout", ("timeout", "timed out", "超时")),
@@ -315,6 +328,87 @@ def _classify_tool_failure(content: str) -> str:
         if any(marker in text for marker in markers):
             return category
     return "other_error"
+
+
+# 工具失败恢复决策表：把"失败类型 → 首选恢复动作 → 何时停止"固化成稳定规则，
+# 而不是让反思层每轮重新文字推演同一套策略（线上证据显示 reflection_count 高、
+# 但 tool_failure_count 长期卡住不收敛，根因正是"高反思、低规则化"）。
+# 每条规则只描述读-only 的决策建议，真正执行仍由调用方/反思层按需采纳。
+_FAILURE_RECOVERY_PLAYBOOK: dict[str, dict[str, str]] = {
+    "rate_limited": {
+        "first_action": "退避后单次重试（指数退避，起步 1-2s）",
+        "fallback": "切换到等价的低频工具或缩小请求范围",
+        "stop_when": "连续 2 次仍 429 即停止重试，转为延后执行并记录证据",
+    },
+    "forbidden": {
+        "first_action": "校验参数/权限范围，确认是否误用需要鉴权的入口",
+        "fallback": "改用只读等价工具或公开数据源",
+        "stop_when": "确认无权限即停止，不要反复重试（重试无意义）",
+    },
+    "upstream_error": {
+        "first_action": "单次重试（上游 5xx/网关错误通常是瞬时抖动）",
+        "fallback": "降级为替代信息源或延后到下一轮执行",
+        "stop_when": "重试 1 次仍失败即停止，记录上游不可用证据",
+    },
+    "timeout": {
+        "first_action": "缩小查询范围/降低数据量后单次重试",
+        "fallback": "切换到更轻量的等价工具",
+        "stop_when": "2 次超时即停止，标记该路径为高延迟并延后",
+    },
+    "unavailable": {
+        "first_action": "确认网络/连接是否瞬时不可用，单次重试",
+        "fallback": "切换到本地缓存或替代来源",
+        "stop_when": "连续 2 次不可用即停止，转为延后执行",
+    },
+    "config_blocked": {
+        "first_action": "确认工具名是否被当前实验/白名单允许；若是幻觉命名先归一化到真实工具名",
+        "fallback": "改用语义等价的已允许工具（如 Glob→file_list、Read→file_read、TodoWrite→self_task_create）",
+        "stop_when": "确认工具未被配置允许即停止，绝不重复调用同一未授权工具名（重试无意义）",
+    },
+    "not_found": {
+        "first_action": "先用 file_list 确认目标路径/资源是否真实存在，再决定是否调用",
+        "fallback": "改用存在的正确路径，或换公开数据源/等价工具获取所需信息",
+        "stop_when": "确认目标不存在即停止，不要对同一不存在的路径反复重试（重试无意义）",
+    },
+    "other_error": {
+        "first_action": "先检查参数/输入完整性，再原样重试一次",
+        "fallback": "改用等价工具或缩小任务范围分步执行",
+        "stop_when": "同类失败第二次仍走同样弯路即停止，标记为需要规则修正",
+    },
+}
+
+
+def build_failure_recovery_playbook(breakdown: dict[str, Any] | None) -> dict[str, Any]:
+    """根据实际失败画像生成一份可执行的恢复决策指引。
+
+    输入是 ``tool_failure_breakdown``（category -> count）。只为真实出现过的
+    失败类别生成规则条目，并按出现次数降序排列，让反思层优先处理高频失败。
+    返回结构是只读建议，不触发任何执行，供 metrics / 反思 prompt 直接引用，
+    把"高反思、低规则化"补上一层稳定的"下次默认动作"。
+    """
+    breakdown = breakdown or {}
+    rules: list[dict[str, Any]] = []
+    for category, count in sorted(
+        breakdown.items(), key=lambda kv: int(kv[1] or 0), reverse=True
+    ):
+        if int(count or 0) <= 0:
+            continue
+        rule = _FAILURE_RECOVERY_PLAYBOOK.get(category, _FAILURE_RECOVERY_PLAYBOOK["other_error"])
+        rules.append({
+            "category": category,
+            "count": int(count or 0),
+            "first_action": rule["first_action"],
+            "fallback": rule["fallback"],
+            "stop_when": rule["stop_when"],
+        })
+    return {
+        "rules": rules,
+        "principle": (
+            "每次工具失败都补三元证据：失败类型 / 恢复动作 / 恢复结果；"
+            "若同类失败第二次仍走同样弯路，视为闭环失效信号，优先修正规则而非增加泛化反思。"
+        ),
+        "evidence_fields": ["failure_category", "recovery_action", "recovery_result"],
+    }
 
 
 def _finalize_rates(metrics: dict[str, Any]) -> None:
@@ -342,5 +436,11 @@ def _finalize_rates(metrics: dict[str, Any]) -> None:
         metrics["reflection_to_action_status"] = "too_reactive"
     else:
         metrics["reflection_to_action_status"] = "balanced"
+
+    # 把"失败类型 → 恢复动作 → 何时停止"决策表按实际失败画像挂进 metrics，
+    # 让反思层/backlog 能直接引用稳定恢复规则，而不是每轮重新文字推演。
+    metrics["failure_recovery_playbook"] = build_failure_recovery_playbook(
+        metrics.get("tool_failure_breakdown")
+    )
 
     metrics["last_events"] = sorted(metrics.get("last_events", []), key=lambda x: x.get("ts", 0))[-50:]

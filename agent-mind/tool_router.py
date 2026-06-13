@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -111,6 +113,60 @@ MAX_CONCURRENT_TOOLS = 10
 HIGH_RISK_TOOLS: dict[str, float] = {
     "file_delete": 0.85,
     "package_install": 0.9,
+}
+
+# 当前实例真实实现/受权限门控的全部工具名（call() dispatcher 能路由的名字）。
+# 用于识别 LLM 幻觉出的通用助手工具名（如 Read/Glob/TodoWrite），把它们与
+# 真实工具区分开，避免“工具名笔误”被错误计入基础设施 tool_failure_count。
+KNOWN_TOOLS: frozenset[str] = frozenset({
+    "web_fetch", "url_fetch", "web_search", "weather", "arxiv_search",
+    "daily_note_read", "daily_note_write", "experiment_status",
+    "self_upgrade_status", "knowledge_search", "tag_memo",
+    "file_list", "file_read", "file_write", "file_append", "patch_write",
+    "memory_write", "self_code_write",
+    "self_task_create", "self_task_update", "self_artifact_create",
+    "shell_exec", "ssh_exec", "schedule_read",
+    "goal_list", "goal_capabilities", "goal_register",
+})
+
+# 工具名别名归一化：把大模型常幻觉出的通用助手命名（Claude/Cursor 风格）映射到
+# 本实例真实工具名，做 1:1 安全等价替换；无法安全等价的名字交给未知工具指引处理。
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    "read": "file_read",
+    "read_file": "file_read",
+    "readfile": "file_read",
+    "view": "file_read",
+    "view_file": "file_read",
+    "cat": "file_read",
+    "open": "file_read",
+    "write": "file_write",
+    "write_file": "file_write",
+    "writefile": "file_write",
+    "create_file": "file_write",
+    "glob": "file_list",
+    "ls": "file_list",
+    "list": "file_list",
+    "list_files": "file_list",
+    "list_dir": "file_list",
+    "listdir": "file_list",
+    "websearch": "web_search",
+    "web_search_tool": "web_search",
+    "search_web": "web_search",
+    "webfetch": "web_fetch",
+    "fetch": "web_fetch",
+    "fetch_url": "web_fetch",
+    "browse": "web_fetch",
+    "bash": "shell_exec",
+    "shell": "shell_exec",
+    "run_command": "shell_exec",
+    "run_shell": "shell_exec",
+    "exec": "shell_exec",
+    "memory_search": "knowledge_search",
+    "recall": "knowledge_search",
+    "note_write": "daily_note_write",
+    "write_note": "daily_note_write",
+    "note_read": "daily_note_read",
+    "read_note": "daily_note_read",
 }
 
 
@@ -645,8 +701,77 @@ class ToolRouter:
                 schema.append(sch)
         return schema
 
+    @staticmethod
+    def _normalize_tool_name(tool_name: str) -> str:
+        """把工具名做安全归一化：去空白、小写匹配别名表，命中则返回真实工具名。
+
+        仅做 1:1 安全等价替换；已是真实工具名（区分大小写匹配 KNOWN_TOOLS）的不改动。
+        """
+        if not isinstance(tool_name, str):
+            return tool_name
+        name = tool_name.strip()
+        if name in KNOWN_TOOLS or name in ToolRouter._capability_tools:
+            return name
+        return _TOOL_NAME_ALIASES.get(name.lower(), name)
+
+    def _unknown_tool_guidance(self, requested_name: str) -> dict:
+        """对真正未知/幻觉的工具名返回结构化指引，而不是基础设施失败。
+
+        status=degraded（非 error）：不计入 tool_failure_count，避免“工具名笔误”
+        污染可靠性指标；同时给出可用工具清单，引导模型改用真实工具名重试。
+        """
+        available = sorted(KNOWN_TOOLS | set(ToolRouter._capability_tools.keys()))
+        result = {
+            "status": "degraded",
+            "tool": requested_name,
+            "diagnosis": "unknown_tool_name",
+            "result": (
+                f"工具 '{requested_name}' 不是本实例可用工具（很可能是工具名笔误或"
+                f"通用助手命名）。请改用下列真实工具名之一重试，不要重复调用同一个不存在的名字。"
+            ),
+            "available_tools": available,
+            "fallback_hint": (
+                "用真实工具名重试：读文件用 file_read、列目录用 file_list、"
+                "搜网用 web_search、抓网页用 web_fetch、检索记忆用 knowledge_search、"
+                "记任务用 self_task_create/self_artifact_create。"
+            ),
+            "recommended_next_actions": [
+                "从 available_tools 选一个语义等价的真实工具名重试。",
+                "若只是想记录待办，用 self_task_create 而非 TodoWrite 等外部命名。",
+                "不要把工具名笔误升级为系统故障，也不要反复重复同一不存在的工具名。",
+            ],
+        }
+        try:
+            self.store.append("events", {
+                "event": "tool_name_unknown",
+                "requested_tool": requested_name,
+                "diagnosis": "unknown_tool_name",
+            })
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入未知工具名事件失败: {exc}")
+        return result
+
     async def call(self, tool_name: str, params: dict) -> dict:
-        """执行工具调用（权限校验 + 直接实现）"""
+        """执行工具调用（工具名归一化 + 权限校验 + 直接实现）
+
+        见 _normalize_tool_name / _unknown_tool_guidance：把幻觉工具名安全归一化，
+        真正未知的名字返回结构化指引而非基础设施失败。
+        """
+        # 1) 工具名归一化：把大模型幻觉出的通用助手命名映射到真实工具名，
+        #    避免“工具名笔误”被错误计入 tool_failure_count。
+        original_name = tool_name
+        tool_name = self._normalize_tool_name(tool_name)
+        if tool_name != original_name:
+            logger.info("[ToolRouter] 工具名归一化: %s → %s", original_name, tool_name)
+
+        # 2) 真正未知的工具名：返回结构化使用指引（非 error），不当作基础设施失败。
+        if (
+            tool_name not in KNOWN_TOOLS
+            and tool_name not in ToolRouter._capability_tools
+            and tool_name not in HIGH_RISK_TOOLS
+        ):
+            return self._unknown_tool_guidance(original_name)
+
         allowed, risk = self._check_permission(tool_name)
         if not allowed:
             return self._finalize_tool_result(tool_name, {"error": f"工具 '{tool_name}' 未被当前实验配置允许", "tool": tool_name, "risk": risk})
@@ -965,8 +1090,72 @@ class ToolRouter:
     # ─────────────────────────────────────────────────────────────
     # Web 抓取：直接 httpx GET
     # ─────────────────────────────────────────────────────────────
+    # 自身应用域名（用于自我观察通道）：抓取这些域名时改写为容器内部端口直连，
+    # 避免 fly.io 容器内把自身域名解析为回环地址而被 SSRF 防护误拒。
+    SELF_APP_HOSTNAMES = frozenset({"aiwake.fly.dev"})
+    SELF_APP_INTERNAL_BASE = "http://127.0.0.1:8000"
+    # 自察只允许只读 GET 端点，防止经由改写通道触发内部写操作。
+    SELF_APP_ALLOWED_PATH_PREFIXES = (
+        "/health",
+        "/activity_logs",
+        "/public_chat",
+        "/state",
+        "/experiment/status",
+        "/experiment/tasks",
+        "/experiment/artifacts",
+        "/evolution/status",
+        "/growth/milestones",
+        "/goal/list",
+        "/goal/capabilities",
+        "/self-upgrade/status",
+        "/self-upgrade/proposals",
+    )
+
+    def _rewrite_self_url(self, parsed) -> Optional[str]:
+        """识别指向自身线上域名的只读端点，并改写为容器内部地址。
+
+        返回改写后的 URL；若不是自身域名或不是允许的只读端点，返回 None（走常规 SSRF 检查）。
+        """
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in self.SELF_APP_HOSTNAMES:
+            return None
+        path = parsed.path or "/"
+        if path != "/" and not any(path == p or path.startswith(p.rstrip("/") + "/") or path.startswith(p) for p in self.SELF_APP_ALLOWED_PATH_PREFIXES):
+            return None
+        query = f"?{parsed.query}" if parsed.query else ""
+        rewritten = f"{self.SELF_APP_INTERNAL_BASE}{path}{query}"
+        logger.info("[ToolRouter] web_fetch 自我观察通道：%s -> 内部端点（只读自察）", hostname + path)
+        return rewritten
+
+    async def _resolve_public_ips_for_fetch(self, hostname: str) -> tuple[bool, str]:
+        """解析主机名并校验全部地址为公网地址（SSRF 防护）。"""
+        import ipaddress
+        import socket
+
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            return False, f"DNS 解析失败: {e}"
+        except Exception as e:
+            return False, f"DNS 解析异常: {type(e).__name__}: {e}"
+
+        addresses = sorted({info[4][0] for info in infos if info and info[4]})
+        if not addresses:
+            return False, "DNS 未返回可用地址"
+        for address in addresses:
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                return False, f"DNS 返回无效地址: {address}"
+            if not ip.is_global:
+                return False, f"安全限制：目标解析到非公网地址 {address}，已拒绝抓取"
+        return True, ",".join(addresses[:4])
+
     async def _web_fetch(self, url: str) -> dict:
-        """直接 HTTP 抓取公开网页内容。包含最小 SSRF 防护、浏览器型请求头与清晰失败诊断。"""
+        """直接 HTTP 抓取公开网页内容。包含最小 SSRF 防护、浏览器型请求头与清晰失败诊断。
+
+        特例：抓取自身线上域名（自我观察）时，自动改写为容器内部只读端点，避免被 SSRF 防护误拒。
+        """
         if not url:
             return {"error": "url 参数不能为空", "tool": "web_fetch"}
 
@@ -989,35 +1178,24 @@ class ToolRouter:
                 "url": url,
             }
 
-        async def _resolve_public_ips(hostname: str) -> tuple[bool, str]:
-            try:
-                infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None, type=socket.SOCK_STREAM)
-            except socket.gaierror as e:
-                return False, f"DNS 解析失败: {e}"
-            except Exception as e:
-                return False, f"DNS 解析异常: {type(e).__name__}: {e}"
-
-            addresses = sorted({info[4][0] for info in infos if info and info[4]})
-            if not addresses:
-                return False, "DNS 未返回可用地址"
-            for address in addresses:
-                try:
-                    ip = ipaddress.ip_address(address)
-                except ValueError:
-                    return False, f"DNS 返回无效地址: {address}"
-                if not ip.is_global:
-                    return False, f"安全限制：目标解析到非公网地址 {address}，已拒绝抓取"
-            return True, ",".join(addresses[:4])
-
-        ok, dns_note = await _resolve_public_ips(parsed.hostname)
-        if not ok:
-            return {
-                "status": "error",
-                "error": dns_note,
-                "tool": "web_fetch",
-                "url": url,
-                "diagnosis": "private_network_safety_restriction" if "非公网地址" in dns_note else "dns_resolution_failure",
-            }
+        # 自我观察通道：抓取自身线上域名时，容器内 DNS 会把自身域名解析为回环地址，
+        # 直接走 SSRF 防护会被误拒。这里识别自身域名并改写为容器内部端口直连（只读自察），
+        # 不影响对其他私网/回环地址的拦截。
+        self_url_rewritten = self._rewrite_self_url(parsed)
+        if self_url_rewritten:
+            url = self_url_rewritten
+            parsed = urlparse(url)
+            dns_note = "self_app_internal"
+        else:
+            ok, dns_note = await self._resolve_public_ips_for_fetch(parsed.hostname)
+            if not ok:
+                return {
+                    "status": "error",
+                    "error": dns_note,
+                    "tool": "web_fetch",
+                    "url": url,
+                    "diagnosis": "private_network_safety_restriction" if "非公网地址" in dns_note else "dns_resolution_failure",
+                }
 
         headers = {
             "User-Agent": (
@@ -1711,6 +1889,41 @@ class ToolRouter:
             return {"error": "部署命令需要 EXPERIMENT_ALLOW_DEPLOY=true，已拦截", "tool": "shell_exec", "risk": risk}
         if "destructive" in risks and not config.experiment_allow_destructive:
             return {"error": "破坏性命令需要 EXPERIMENT_ALLOW_DESTRUCTIVE=true 或快照保护，已拦截", "tool": "shell_exec", "risk": risk}
+        # 预检：主二进制是否存在，若不存在直接返回 unavailable，避免被错分到 forbidden
+        # 或 aiwake_internal_tool_failure，提升 tool_router 对“环境缺失”这一失败类型的可读性。
+        try:
+            _primary_cmd = ""
+            try:
+                _tokens = shlex.split(command, posix=True)
+                if _tokens:
+                    _primary_cmd = _tokens[0]
+            except ValueError:
+                # shlex 解析失败时退化为按空白切分，避免引号异常导致预检短路
+                _parts = command.strip().split()
+                _primary_cmd = _parts[0] if _parts else ""
+            # 仅对“纯命令名”做存在性校验；带路径或带 shell 元字符的复合命令交由 shell 自行处理
+            _shell_metas = {"&&", "||", "|", ";", ">", "<", ">>", "(", ")", "`", "$("}
+            _has_meta = any(m in command for m in _shell_metas)
+            if (
+                _primary_cmd
+                and not _has_meta
+                and "/" not in _primary_cmd
+                and not _primary_cmd.startswith(".")
+                and shutil.which(_primary_cmd) is None
+            ):
+                return {
+                    "status": "error",
+                    "tool": "shell_exec",
+                    "command": risk.get("redacted_command"),
+                    "risk": risk,
+                    "classification": "unavailable",
+                    "failure_type": "unavailable",
+                    "error": f"命令 '{_primary_cmd}' 在当前容器内不可用（未找到对应二进制）",
+                    "reason": "missing_binary",
+                }
+        except Exception as _pre_e:
+            # 预检本身失败时不要阻塞真实执行，记录后继续。
+            logger.debug(f"[ToolRouter] shell_exec pre-check skipped: {_pre_e}")
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,

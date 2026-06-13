@@ -134,6 +134,16 @@ class LLMGate:
             ),
         }
 
+        # 推理强度（reasoning_effort）：GPT-5 / o-series 等推理模型支持的 OpenAI 兼容字段。
+        # 取值梯度：xhigh > high > medium > low > minimal > ""
+        #   - "xhigh" 是本项目接入的 GPT-5 网关支持的"超高"档（标准 OpenAI 仅到 "high"，xhigh 是供应商扩展）
+        #   - 空字符串 = 不注入，保持服务端默认（一键回滚开关）
+        # 默认拉到 "xhigh"（=超高）：让用户作业链路与心跳反思链路都走最深的思维链。
+        # 通过 env var 可一键回滚：`WORK_REASONING_EFFORT=` / `REFLECT_REASONING_EFFORT=` 留空即不再注入；
+        # 也可降到 "high" / "medium" 等档位以观察推理强度对产出/成本的影响。
+        self.work_reasoning_effort = os.getenv("WORK_REASONING_EFFORT", "xhigh").strip()
+        self.reflect_reasoning_effort = os.getenv("REFLECT_REASONING_EFFORT", "xhigh").strip()
+
         # 兼容旧字段，供旧调用和日志继续工作。
         self.cloud_api_url = self.profiles["work"].api_url
         self.cloud_api_key = self.profiles["work"].api_key
@@ -145,11 +155,13 @@ class LLMGate:
         self._profile_hour_start = {"work": 0.0, "reflect": 0.0}
 
         logger.info(
-            "[LLM Gate] 模型配置: local=%s(%s), work=%s, reflect=%s",
+            "[LLM Gate] 模型配置: local=%s(%s), work=%s(reasoning_effort=%s), reflect=%s(reasoning_effort=%s)",
             "enabled" if self.local_model_enabled else "disabled",
             self.local_model,
             self.profiles["work"].model,
+            self.work_reasoning_effort or "<server-default>",
             self.profiles["reflect"].model,
+            self.reflect_reasoning_effort or "<server-default>",
         )
 
         # 加载运行时人格与 AIwake 规则（启动时读取一次，避免每次读磁盘）
@@ -242,6 +254,22 @@ class LLMGate:
             self._cloud_calls_this_hour = self._profile_call_counts[profile.name]
             self._hour_start = self._profile_hour_start[profile.name]
 
+    def _reasoning_effort_for(self, profile_name: str) -> str:
+        """根据 profile 返回应注入的 reasoning_effort。
+        空字符串 = 不注入（保持服务端默认 / 一键回滚）。
+        """
+        if profile_name == "reflect":
+            return self.reflect_reasoning_effort or ""
+        return self.work_reasoning_effort or ""
+
+    def _maybe_inject_reasoning(self, payload: dict, profile_name: str) -> None:
+        """如果配置了 reasoning_effort，把它注入到 OpenAI 兼容 payload 中。
+        不识别该字段的服务端会忽略或返回 400，调用方已有重试/回退保护。
+        """
+        effort = self._reasoning_effort_for(profile_name)
+        if effort:
+            payload["reasoning_effort"] = effort
+
     async def call_cloud(self, system_prompt: str, user_message: str,
                          profile_name: str = "work") -> str:
         """调用云端 OpenAI 兼容接口，默认使用工作/学习模型。"""
@@ -256,6 +284,14 @@ class LLMGate:
 
             self._count_profile_call(profile)
             full_system = self._inject_agent_card(system_prompt)
+            payload = {
+                "model": profile.model,
+                "messages": [
+                    {"role": "system", "content": full_system},
+                    {"role": "user", "content": user_message},
+                ],
+            }
+            self._maybe_inject_reasoning(payload, profile.name)
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
                     f"{profile.api_url.rstrip('/')}/chat/completions",
@@ -263,13 +299,7 @@ class LLMGate:
                         "Authorization": f"Bearer {profile.api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": profile.model,
-                        "messages": [
-                            {"role": "system", "content": full_system},
-                            {"role": "user", "content": user_message},
-                        ],
-                    }
+                    json=payload,
                 )
                 resp.raise_for_status()
                 return _extract_content(resp.json()["choices"][0]["message"])
@@ -398,13 +428,15 @@ class LLMGate:
         profile = self._get_profile(profile_name)
         if profile.configured:
             full_messages = [{"role": "system", "content": full_system}] + messages
+            vcp_payload = {
+                "model": profile.model,
+                "messages": full_messages,
+                "user": user_id,
+                "stream": False,
+            }
+            self._maybe_inject_reasoning(vcp_payload, profile.name)
             data = await self._cloud_post_with_retry(
-                payload={
-                    "model": profile.model,
-                    "messages": full_messages,
-                    "user": user_id,
-                    "stream": False,
-                },
+                payload=vcp_payload,
                 label="call_via_vcp",
                 profile_name=profile.name,
             )
@@ -432,12 +464,15 @@ class LLMGate:
         user_id: str = "default",
         max_rounds: int = 8,
         profile_name: str = "work",
+        max_tokens_override: int | None = None,
     ) -> tuple[str, "LLMTier"]:
         """
         OpenAI Function Calling 原生工具调用循环。
         - tools_schema: OpenAI 格式工具定义数组（来自 ToolRouter.get_openai_tools_schema()）
         - tool_executor: async callable(tool_name: str, params: dict) -> dict
         - 支持多轮工具调用（最多 max_rounds 轮）
+        - max_tokens_override: 可选的 max_tokens 物理上限（用于 vitality 环境压力 token 收缩，
+          仅作用于本次工具调用循环；不传则保持原行为不写 max_tokens）
         - 返回 (最终文本回复, LLMTier)
         """
         profile = self._get_profile(profile_name)
@@ -459,6 +494,11 @@ class LLMGate:
                 "user": user_id,
                 "stream": False,
             }
+            # 推理强度：work / reflect 各自独立的 reasoning_effort 配置
+            self._maybe_inject_reasoning(payload, profile.name)
+            # M-002 环境压力：物理截断反思 token 上限，让 LLM 无法继续"写日记"
+            if isinstance(max_tokens_override, int) and max_tokens_override > 0:
+                payload["max_tokens"] = max_tokens_override
             # 只在有工具定义时传入 tools 参数
             if tools_schema:
                 payload["tools"] = tools_schema
@@ -473,6 +513,9 @@ class LLMGate:
                 work_profile = self.profiles["work"]
                 fallback_payload = dict(payload)
                 fallback_payload["model"] = work_profile.model
+                # 回退到 work profile 时，按 work 的 reasoning_effort 重新注入
+                fallback_payload.pop("reasoning_effort", None)
+                self._maybe_inject_reasoning(fallback_payload, "work")
                 logger.warning(
                     "[LLM Gate] reflect profile 工具循环失败，安全回退到 work profile 继续自主反思"
                 )

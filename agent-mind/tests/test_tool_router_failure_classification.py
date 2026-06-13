@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _find_agent_dir() -> Path:
@@ -83,6 +84,49 @@ def main() -> None:
     assert empty["status"] == "ok"
     assert empty["failure_type"] == "empty_result"
     assert "明确日期" in empty["fallback_hint"]
+
+    local_endpoint = router._classify_failure(
+        "shell_exec",
+        {
+            "status": "error",
+            "tool": "shell_exec",
+            "command": "curl http://localhost:8000/experiment/status",
+            "result": "STATUS_UNAVAILABLE",
+            "returncode": 7,
+        },
+    )
+    assert local_endpoint["failure_type"] == "local_endpoint_unavailable/environment_boundary"
+    assert "experiment_status" in local_endpoint["fallback_hint"]
+
+    with patch("tool_router.append_growth_log") as append_growth_log:
+        audit_result = router._finalize_tool_result(
+            "web_fetch",
+            {
+                "status": "error",
+                "tool": "web_fetch",
+                "url": "https://example.com/flaky",
+                "http_status": 503,
+                "error": "目标站点返回 HTTP 503 Service Unavailable",
+            },
+        )
+    assert audit_result["failure_type"] == "external_rate_limited_or_unavailable"
+    append_growth_log.assert_called_once()
+    audit_item = append_growth_log.call_args.args[0]
+    assert audit_item["event"] == "tool_failure_audit"
+    assert audit_item["tool"] == "web_fetch"
+    assert audit_item["failure_type"] == "external_rate_limited_or_unavailable"
+    assert "退避" in audit_item["fallback_hint"]
+
+    with patch("tool_router.append_growth_log") as append_growth_log:
+        router._finalize_tool_result(
+            "daily_note_read",
+            {
+                "status": "ok",
+                "tool": "daily_note_read",
+                "result": "[today 暂无日记]",
+            },
+        )
+    append_growth_log.assert_not_called()
 
     print("tool_router_failure_classification_selfcheck: ok")
 
