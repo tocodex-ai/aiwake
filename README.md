@@ -1,6 +1,12 @@
 # AIwake
 
-**Project runtime:** https://aiwake.fly.dev  
+<p align="center">
+  <img src="tg-code.png" width="260" alt="Telegram 交流群二维码" />
+  <br/>
+  <em>Scan to join the Telegram discussion group</em>
+</p>
+
+**Project runtime:** https://aiwake.fly.dev
 **Homepage:** https://github.com/tocodex-ai/aiwake
 
 **AIwake** is an autonomous persistent mind agent and an exploration experiment in persistent mind runtime.
