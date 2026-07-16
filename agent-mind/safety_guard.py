@@ -1,6 +1,7 @@
 """最低安全守卫：路径、命令风险识别与密钥脱敏。"""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -121,7 +122,7 @@ def is_memory_path(path: str | Path) -> bool:
 
 
 def is_self_project_code_path(path: str | Path) -> bool:
-    """识别 AIwake 自身项目代码/运行规则文件。"""
+    """识别 AIwake 自身项目代码、测试与运行规则文件。"""
     text = _normalized_path(path)
     if not text:
         return False
@@ -130,7 +131,25 @@ def is_self_project_code_path(path: str | Path) -> bool:
         return False
     if not (text.endswith(_SELF_CODE_SUFFIXES) or name in {"dockerfile", "requirements.txt"}):
         return False
-    return name in _SELF_CORE_FILES or any(marker in text for marker in _SELF_CODE_MARKERS)
+
+    # Fly 镜像将项目扁平复制到 /app，因此自身回归测试位于 /app/tests；
+    # 模型也可能给出 tests/... 或 src/agent-mind/tests/... 仓库相对路径。
+    # 绝对路径必须位于 APP_ROOT 或当前模块所在项目根目录，避免误放行
+    # /tmp/tests、/tmp/agent-mind/tests 等项目外路径。
+    app_root = _normalized_path(os.getenv("APP_ROOT", "/app")).rstrip("/")
+    module_root = _normalized_path(Path(__file__).resolve().parent).rstrip("/")
+    project_test_path = (
+        text.startswith("tests/")
+        or text.startswith("src/agent-mind/tests/")
+        or (bool(app_root) and text.startswith(f"{app_root}/tests/"))
+        or (bool(module_root) and text.startswith(f"{module_root}/tests/"))
+    )
+    # 测试目录必须命中上面的项目根边界；不能仅凭通用的
+    # ``agent-mind/`` 源码 marker 放行 /tmp/agent-mind/tests 等伪造路径。
+    looks_like_test_path = text.startswith("tests/") or "/tests/" in f"/{text.lstrip('/')}"
+    if looks_like_test_path and not project_test_path:
+        return False
+    return project_test_path or name in _SELF_CORE_FILES or any(marker in text for marker in _SELF_CODE_MARKERS)
 
 
 def has_self_modification_audit(audit: dict[str, Any] | None) -> tuple[bool, list[str]]:

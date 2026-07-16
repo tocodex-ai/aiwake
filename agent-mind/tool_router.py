@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +27,18 @@ from typing import Optional
 import httpx
 
 from autonomy_config import load_autonomy_config
+from command_precheck import precheck_command
 from experiment_store import get_experiment_store
 from evolution.memory import append_growth_log
+from evolution.growth_tracker import record_growth_milestone
+from evolution.self_upgrade import proposal_status_summary
+from evolution.goal_tracker import (
+    register_goal as _gt_register_goal,
+    read_open_goals as _gt_read_open_goals,
+    read_all_goals as _gt_read_all_goals,
+    read_capabilities as _gt_read_capabilities,
+    METRIC_REGISTRY as _GT_METRIC_REGISTRY,
+)
 from safety_guard import (
     classify_command_risk,
     has_self_modification_audit,
@@ -53,6 +65,9 @@ ALLOWED_TOOLS: dict[str, float] = {
     "knowledge_search": 0.1,
     "daily_note_read": 0.1,
     "schedule_read": 0.05,
+    "experiment_status": 0.08,
+    "self_upgrade_status": 0.1,
+    "degradation_evidence_miner": 0.12,
     "arxiv_search": 0.1,
     "tag_memo": 0.1,
     # 写入工具
@@ -68,6 +83,10 @@ ALLOWED_TOOLS: dict[str, float] = {
     "self_task_create": 0.2,
     "self_task_update": 0.2,
     "self_artifact_create": 0.25,
+    # ── 目标闭环工具（改→度量→收敛）──
+    "goal_list": 0.05,           # 只读：列出当前可用 metrics + 开放/全部目标
+    "goal_capabilities": 0.05,   # 只读：列出已沉淀入库的能力
+    "goal_register": 0.2,        # 写入：登记一个可度量改进目标进入闭环
 }
 
 # 并发安全的只读工具（参考 Claude Code toolOrchestration.ts isConcurrencySafe）
@@ -80,9 +99,14 @@ READONLY_TOOLS: frozenset[str] = frozenset({
     "knowledge_search",
     "daily_note_read",
     "schedule_read",
+    "experiment_status",
+    "self_upgrade_status",
+    "degradation_evidence_miner",
     "arxiv_search",
     "tag_memo",
     "file_list",
+    "goal_list",
+    "goal_capabilities",
 })
 
 # 并发批执行的最大并发数（参考 Claude Code runToolsConcurrently 最多10个）
@@ -94,30 +118,160 @@ HIGH_RISK_TOOLS: dict[str, float] = {
     "package_install": 0.9,
 }
 
+# 当前实例真实实现/受权限门控的全部工具名（call() dispatcher 能路由的名字）。
+# 用于识别 LLM 幻觉出的通用助手工具名（如 Read/Glob/TodoWrite），把它们与
+# 真实工具区分开，避免“工具名笔误”被错误计入基础设施 tool_failure_count。
+KNOWN_TOOLS: frozenset[str] = frozenset({
+    "web_fetch", "url_fetch", "web_search", "weather", "arxiv_search",
+    "daily_note_read", "daily_note_write", "experiment_status",
+    "self_upgrade_status", "degradation_evidence_miner", "knowledge_search", "tag_memo",
+    "file_list", "file_read", "file_write", "file_append", "patch_write",
+    "memory_write", "self_code_write",
+    "self_task_create", "self_task_update", "self_artifact_create",
+    "shell_exec", "ssh_exec", "schedule_read",
+    "goal_list", "goal_capabilities", "goal_register",
+})
+
+# 工具名别名归一化：把大模型常幻觉出的通用助手命名（Claude/Cursor 风格）映射到
+# 本实例真实工具名，做 1:1 安全等价替换；无法安全等价的名字交给未知工具指引处理。
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    "read": "file_read",
+    "read_file": "file_read",
+    "readfile": "file_read",
+    "view": "file_read",
+    "view_file": "file_read",
+    "cat": "file_read",
+    "open": "file_read",
+    "write": "file_write",
+    "write_file": "file_write",
+    "writefile": "file_write",
+    "create_file": "file_write",
+    "glob": "file_list",
+    "ls": "file_list",
+    "list": "file_list",
+    "list_files": "file_list",
+    "list_dir": "file_list",
+    "listdir": "file_list",
+    "websearch": "web_search",
+    "web_search_tool": "web_search",
+    "search_web": "web_search",
+    "webfetch": "web_fetch",
+    "fetch": "web_fetch",
+    "fetch_url": "web_fetch",
+    "browse": "web_fetch",
+    "bash": "shell_exec",
+    "shell": "shell_exec",
+    "run_command": "shell_exec",
+    "run_shell": "shell_exec",
+    "exec": "shell_exec",
+    "memory_search": "knowledge_search",
+    "recall": "knowledge_search",
+    "note_write": "daily_note_write",
+    "write_note": "daily_note_write",
+    "note_read": "daily_note_read",
+    "read_note": "daily_note_read",
+}
+
+
+# rate_limited 时的备选工具表（与线上对齐）
+_RATE_LIMIT_ALTERNATIVES: dict[str, list[str]] = {
+    "web_search": ["web_fetch", "url_fetch"],
+    "web_fetch": ["url_fetch"],
+    "url_fetch": ["web_fetch"],
+    "arxiv_search": ["web_search", "web_fetch"],
+    "weather": ["web_fetch"],
+}
+
 
 class ToolRouter:
+    # 类级共享：避免每次实例化重复扫描能力库
+    _capability_tools: dict[str, dict] = {}
+
     def __init__(self):
         self.store = get_experiment_store()
+        # 启动时扫描能力库，把带 tool_spec 的能力注册成新工具
+        self._reload_capability_tools()
+
+    def _reload_capability_tools(self) -> None:
+        """重新扫描 capability_library.jsonl，更新动态工具注册表。"""
+        try:
+            from capability_tools import load_capability_tools
+            registered = load_capability_tools()
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"[ToolRouter] 加载能力工具失败: {e}")
+            registered = {}
+        # 用类级 dict，确保所有 ToolRouter 实例看到同一份注册表
+        ToolRouter._capability_tools = registered
+        # 同步到 ALLOWED_TOOLS / READONLY_TOOLS（不覆盖已存在的核心工具）
+        for name, record in registered.items():
+            if name in ALLOWED_TOOLS:
+                continue
+            ALLOWED_TOOLS[name] = record["risk"]
+            if record.get("readonly"):
+                # READONLY_TOOLS 是 frozenset，需要重建
+                pass  # 通过 _check_permission 路径上行为已经一致；并发安全检查由 ToolRouter.call_batch 单独决策
 
     def _classify_failure(self, tool_name: str, result: dict) -> dict:
         """为工具失败补充稳定的分类与降级路径，帮助下一轮反思可直接行动。"""
         status = str(result.get("status") or "").lower()
         error_text = str(result.get("error") or result.get("result") or "")
+        result_text = str(result.get("result") or "")
         diagnosis_text = str(result.get("diagnosis") or result.get("diagnostic") or "")
         http_status = result.get("http_status")
+        existing_failure_type = str(result.get("failure_type") or "").strip()
+        nonzero_shell_return = tool_name == "shell_exec" and result.get("returncode") not in (None, 0)
+        shell_search_empty = tool_name == "shell_exec" and self._looks_like_readonly_search_no_match(result)
         empty_ok = (
-            tool_name in {"daily_note_read", "knowledge_search"}
-            and status == "ok"
-            and not result.get("error")
-            and self._looks_empty_result(result.get("result"))
+            existing_failure_type == "empty_result"
+            or shell_search_empty
+            or (
+                tool_name in {"daily_note_read", "knowledge_search"}
+                and status == "ok"
+                and not result.get("error")
+                and self._looks_empty_result(result.get("result"))
+            )
         )
-        if not empty_ok and not result.get("error") and status not in {"error", "degraded"}:
+        command_missing = existing_failure_type == "command_missing" or (
+            tool_name == "shell_exec"
+            and nonzero_shell_return
+            and self._looks_like_command_missing_result(result)
+        )
+        # shell 软失败：复合/管道命令整体 returncode=0，但 stderr 文本里藏着明确的
+        # 路径不存在/命令缺失等失败信号（如 `cat: x: No such file or directory`）。
+        # 此类历史上被错标为 success，导致 AIwake 反复"对项目路径的假设错了"却收不到清晰失败信号。
+        shell_partial_failure = (
+            tool_name == "shell_exec"
+            and result.get("returncode") in (None, 0)
+            and not command_missing
+            and self._looks_like_shell_stderr_failure(str(result.get("result") or ""))
+        )
+        if (
+            not empty_ok
+            and not nonzero_shell_return
+            and not command_missing
+            and not shell_partial_failure
+            and not result.get("error")
+            and status not in {"error", "degraded"}
+        ):
             return result
 
-        combined = f"{tool_name} {status} {error_text} {diagnosis_text}".lower()
-        if empty_ok:
+        combined = f"{tool_name} {status} {error_text} {diagnosis_text} {result.get('command', '')}".lower()
+        if command_missing:
+            failure_type = "command_missing"
+            fallback_hint = "请求的命令在当前环境中不存在（returncode 127 或 'not found'）；改用已存在的等价命令（如 grep 代替 rg、find 代替 fd），不要重复调用同一缺失命令。"
+        elif shell_partial_failure:
+            failure_type = "shell_partial_failure"
+            fallback_hint = "命令整体 returncode=0，但 stderr 里有明确失败信号（路径不存在/命令缺失等）——这通常是路径假设错误，不是工具不可靠。先用 file_list 列出实际存在的目录结构、或用 experiment_status 等结构化接口锚定真实路径，再基于真实路径重建命令，不要据 returncode=0 断言命令成功。"
+        elif empty_ok:
             failure_type = "empty_result"
-            fallback_hint = "工具可用但结果为空；改用明确日期/更具体关键词重试，并用写入记录、公开状态或活动日志交叉验证，不能据此断言记忆不存在。"
+            if shell_search_empty:
+                fallback_hint = "只读搜索命令返回码 1 且无 stdout/stderr，语义是无匹配/未匹配到结果，不是 shell_exec 基础设施故障；可记录为空结果，必要时调整关键词或扩大路径后单次复验。"
+            else:
+                fallback_hint = "工具可用但结果为空；改用明确日期/更具体关键词重试，并用写入记录、公开状态或活动日志交叉验证，不能据此断言记忆不存在。"
+        elif tool_name == "shell_exec" and self._looks_like_local_endpoint_boundary(combined):
+            failure_type = "local_endpoint_unavailable/environment_boundary"
+            fallback_hint = "shell_exec 访问容器内 localhost 或 /experiment/status 失败只说明当前执行环境边界不可用；验证线上状态应使用 experiment_status、公开 HTTPS 状态接口或 activity 日志交叉验证，不要升级为线上服务故障。"
         elif str(result.get("diagnosis") or "") == "api_path_misuse" or self._looks_like_api_path_misuse(combined):
             failure_type = "execution_context_mismatch/tool_path_boundary_misuse"
             fallback_hint = "这是 HTTP/API 路由与本地文件/命令上下文混用；改用 web_fetch/url_fetch 读取公网 HTTPS 端点，或使用结构化状态接口，不要用 shell cat/file_read 读取 API 路径。"
@@ -130,9 +284,9 @@ class ToolRouter:
         elif http_status in {401, 403}:
             failure_type = "external_access_restricted"
             fallback_hint = "目标站点拒绝公开抓取；换公开来源或搜索摘要，不要访问凭据或尝试绕过登录/地区/机器人限制。"
-        elif http_status in {429, 503}:
-            failure_type = "external_rate_limited_or_unavailable"
-            fallback_hint = "外部站点限流/临时不可用；退避后重试一次，或改用等价网络工具与公开接口。"
+        elif http_status in {429, 503} or "rate limit" in combined or "rate_limit" in combined or "ratelimit" in combined or "已超出限制" in error_text or "too many requests" in combined:
+            failure_type = "rate_limited"
+            fallback_hint = "外部站点限流/临时不可用；已自动尝试备选工具，也可退避后重试或改用等价网络工具。"
         elif "timeout" in combined or "超时" in error_text:
             failure_type = "readonly_observation_timeout" if tool_name in {"web_fetch", "url_fetch", "file_read", "knowledge_search", "daily_note_read"} else "aiwake_tool_timeout"
             fallback_hint = "降低 limit/缩短 hours/拆分任务后重试一次；修复后用 cache.mode、耗时、任务-artifact 匹配关系交叉验证。"
@@ -142,25 +296,134 @@ class ToolRouter:
         elif "permission" in combined or "allowed" in combined or "配置" in error_text or "拦截" in error_text:
             failure_type = "aiwake_tool_policy_failure"
             fallback_hint = "不要绕过安全策略；改用允许的只读工具或先生成 self_task/artifact 记录证据与边界。"
-        elif tool_name in {"file_read", "file_list", "file_write", "file_append", "self_code_write", "shell_exec", "ssh_exec"}:
-            failure_type = "aiwake_internal_tool_failure"
-            fallback_hint = "先确认参数、路径和安全边界；对文件/API 路径误用改用推荐工具；对命令失败保留 stderr/returncode。"
+        elif tool_name in {"file_read", "file_list"}:
+            failure_type = "data_retrieval_failure"
+            fallback_hint = "内部数据读取失败；先确认真实路径和读取参数，对 API 路径改用结构化状态工具或公开只读接口。"
+        elif tool_name in {"file_write", "file_append", "self_code_write", "shell_exec", "ssh_exec"}:
+            failure_type = "state_mutation_failure"
+            fallback_hint = "内部状态变更失败；检查目标路径、命令参数、returncode 与安全边界，并用只读探查确认现状后再重试。"
         else:
-            failure_type = "aiwake_tool_failure"
-            fallback_hint = "记录 error/status/工具名/参数摘要，选择等价工具或创建学习 artifact 后再继续。"
+            # 未命中高置信度专用规则时，按工具职责与错误语义细分兜底类别，
+            # 避免所有未知故障都堆积成无法行动的 aiwake_tool_failure。
+            retrieval_tools = {
+                "web_search", "web_fetch", "url_fetch", "file_read",
+                "daily_note_read", "knowledge_search", "arxiv_search", "weather",
+            }
+            mutation_tools = {
+                "file_write", "file_append", "self_code_write", "shell_exec", "ssh_exec",
+            }
+            query_tools = {
+                "experiment_status", "self_upgrade_status", "goal_list", "goal_capabilities",
+            }
+            if tool_name in retrieval_tools:
+                failure_type = "data_retrieval_failure"
+                fallback_hint = "数据检索失败（未匹配已知具体模式）；检查目标/参数与来源可达性，或换用等价检索工具。"
+            elif tool_name in mutation_tools:
+                failure_type = "state_mutation_failure"
+                fallback_hint = "状态变更失败（未匹配已知具体模式）；检查目标路径/命令参数，并用只读探查确认现状后再重试。"
+            elif tool_name in query_tools:
+                failure_type = "state_query_failure"
+                fallback_hint = "状态查询失败（未匹配已知具体模式）；检查查询参数，或用对应结构化状态来源交叉验证。"
+            elif any(
+                marker in combined
+                for marker in ("invalid", "schema", "validation", "format", "type error", "unexpected")
+            ):
+                failure_type = "schema_validation_failure"
+                fallback_hint = "参数校验或格式验证失败；检查调用参数的类型、结构和取值范围。"
+            else:
+                failure_type = "unknown_error"
+                fallback_hint = "未分类的工具错误；记录 error/status/工具名与参数摘要，供后续聚类改进。"
 
         enriched = dict(result)
         enriched.setdefault("status", "ok" if empty_ok else "error")
+        if empty_ok:
+            enriched["status"] = "ok"
         enriched.setdefault("tool", tool_name)
         enriched.setdefault("failure_type", failure_type)
         enriched.setdefault("error_type", type(result.get("error")).__name__ if result.get("error") is not None else status or "degraded")
         enriched.setdefault("fallback_hint", fallback_hint)
         enriched.setdefault("recommended_next_actions", [
+            "重新检视本次调用的证据目标是否已满足，未满足则按降级路径行动并闭合任务。",
             "复述可验证字段：tool/status/error/http_status/diagnosis/returncode。",
             "按 failure_type 选择降级路径，不把一次失败误判为整体不可用。",
             "降级后再次读取状态或日志，确认是否完成闭环。",
         ])
         return enriched
+
+    def _finalize_tool_result(self, tool_name: str, result: dict) -> dict:
+        """统一补充失败分类，并把成功/失败审计追加到成长与事件记录。"""
+        enriched = self._classify_failure(tool_name, result)
+        self._record_tool_failure_audit(tool_name, enriched)
+        if not enriched.get("failure_type") or enriched.get("failure_type") == "empty_result":
+            self._record_tool_success_audit(tool_name, enriched)
+        return enriched
+
+    def _record_tool_failure_audit(self, tool_name: str, result: dict) -> None:
+        """把工具失败原因与降级路径持久化，供后续反思形成可追溯闭环。"""
+        failure_type = result.get("failure_type")
+        if not failure_type or failure_type == "empty_result":
+            return
+        audit_item = {
+            "event": "tool_failure_audit",
+            "tool": tool_name,
+            "failure_type": failure_type,
+            "status": result.get("status"),
+            "error": redact_secrets(result.get("error") or result.get("result") or ""),
+            "http_status": result.get("http_status"),
+            "diagnosis": result.get("diagnosis") or result.get("diagnostic"),
+            "returncode": result.get("returncode"),
+            "fallback_hint": result.get("fallback_hint"),
+            "recommended_next_actions": result.get("recommended_next_actions", []),
+        }
+        try:
+            append_growth_log(audit_item)
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入工具失败成长审计失败: {exc}")
+        try:
+            self.store.append("events", audit_item)
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入工具失败事件审计失败: {exc}")
+        # 自动追加 failure triad：failure_category / recovery_action / recovery_result
+        try:
+            from evolution.failure_triads import append_failure_triad
+
+            triad = append_failure_triad(
+                tool_name=tool_name,
+                failure_type=str(failure_type),
+                error=audit_item.get("error"),
+                recovery_action=str(result.get("fallback_hint") or ""),
+                recovery_result="recorded_pending_recovery",
+                status=str(result.get("status") or ""),
+                http_status=result.get("http_status"),
+                returncode=result.get("returncode"),
+                diagnosis=audit_item.get("diagnosis"),
+                source="tool_router.auto_triad",
+                extra={"fallback_hint": result.get("fallback_hint")},
+            )
+            result["failure_triad_id"] = triad.get("id")
+            result["failure_category"] = triad.get("failure_category")
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入 failure_triad 失败: {exc}")
+
+    def _record_tool_success_audit(self, tool_name: str, result: dict) -> None:
+        """记录成功工具调用的精简审计，供反思核对行动与结果。"""
+        audit_item = {
+            "event": "tool_success_audit",
+            "tool": tool_name,
+            "status": result.get("status", "ok"),
+            "result_length": len(str(result.get("result") or "")),
+            "http_status": result.get("http_status"),
+            "returncode": result.get("returncode"),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        try:
+            append_growth_log(audit_item)
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入工具成功成长审计失败: {exc}")
+        try:
+            self.store.append("events", audit_item)
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入工具成功事件审计失败: {exc}")
 
     def _looks_empty_result(self, value: object) -> bool:
         """识别工具成功但无语义内容的结果，避免被误判为工具故障或记忆不存在。"""
@@ -168,6 +431,131 @@ class ToolRouter:
         if not text:
             return True
         return bool(re.fullmatch(r"\[[^\]]*(暂无|未找到|无结果|empty|not found)[^\]]*\]", text, re.IGNORECASE))
+
+    _READONLY_SEARCH_COMMAND_PATTERN = re.compile(
+        r"(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)(?:command\s+)?(?:grep|egrep|fgrep|rg|ripgrep|ag|ack)\b",
+        re.IGNORECASE,
+    )
+    _COMMAND_MISSING_RESULT_PATTERN = re.compile(
+        r"(?:^|\n)\s*(?:/bin/)?(?:ba)?sh:\s*\d+:\s*[^:\n]+:\s*not found"
+        r"|(?:^|\n)\s*[^:\n]+:\s*command not found",
+        re.IGNORECASE,
+    )
+
+    def _looks_like_readonly_search_no_match(self, result: dict) -> bool:
+        """识别 grep/rg 等只读搜索“无匹配”的退出码 1，而非执行故障。"""
+        try:
+            returncode = int(result.get("returncode"))
+        except (TypeError, ValueError):
+            return False
+        if returncode != 1 or result.get("error"):
+            return False
+        if str(result.get("result") or "").strip():
+            return False
+        command = str(result.get("command") or "")
+        return bool(self._READONLY_SEARCH_COMMAND_PATTERN.search(command))
+
+    def _looks_like_command_missing_result(self, result: dict) -> bool:
+        """识别真正的命令缺失，避免把搜索文本中的 not found 误分为 command_missing。"""
+        try:
+            returncode = int(result.get("returncode"))
+        except (TypeError, ValueError):
+            returncode = None
+        if returncode == 127:
+            return True
+        text = "\n".join(
+            str(result.get(key) or "")
+            for key in ("error", "result", "reason")
+            if result.get(key) is not None
+        )
+        if str(result.get("reason") or "") in {"missing_binary", "missing_binary_no_fallback"}:
+            return True
+        return bool(self._COMMAND_MISSING_RESULT_PATTERN.search(text))
+
+    # shell 复合命令整体 returncode=0，但 stderr/stdout 里藏着明确失败信号时识别这些高置信度短语。
+    _SHELL_STDERR_FAILURE_MARKERS = (
+        "no such file or directory",
+        "not a directory",
+        "command not found",
+        "permission denied",
+        "cannot access",
+        "cannot open",
+        "cannot stat",
+        "cannot remove",
+        "operation not permitted",
+    )
+
+    # 典型 shell 命令报错格式：`命令名: [可选路径:] 错误短语`（如 `cat: x: No such file or directory`、
+    # `ls: cannot access 'x': No such file or directory`、`bash: foo: command not found`）。
+    # 命令用 `2>&1` 把 stderr 合并进 stdout 时结果文本不带 `[stderr]:` 段，需用此模式兜底识别，
+    # 同时要求"命令名: ... 错误短语"的结构，避免把正常 stdout 里偶含这些词的内容误判为失败。
+    # 关键收紧：命令名部分必须至少含一个字母字符（lookahead `(?=[\w./-]*[a-z])`）。
+    # 真实 shell 命令名（cat/ls/find/bash/./script 等）总含字母；而 `sed -n`/`python - <<PY`
+    # 打印源码时输出的纯数字行号（如 `400: "no such file or directory",`）不含字母，
+    # 不应被当成命令报错。否则 AIwake 用 shell_exec 读自身源码做诊断时，源码里恰好出现的
+    # 错误短语字面量会被误判为 shell_partial_failure，导致 returncode=0 的成功命令收到
+    # "失败"信号，陷入反复诊断却无法落地的反思空转循环（线上证据 2026-06-25）。
+    _SHELL_CMD_ERROR_PATTERN = re.compile(
+        r"(?:^|\n)\s*(?=[\w./-]*[a-z])[\w./-]+:\s.*?(?:"
+        r"no such file or directory|not a directory|command not found|permission denied|"
+        r"cannot access|cannot open|cannot stat|cannot remove|operation not permitted"
+        r")",
+        re.IGNORECASE,
+    )
+
+    def _looks_like_shell_stderr_failure(self, value: object) -> bool:
+        """识别 returncode=0 但输出里含明确失败信号的 shell 软失败。
+
+        两种识别路径：
+        1) 结果文本带 `[stderr]:` 段时，只检查该段内容。stdout 中可能只是
+           打印源码或文档里的错误短语，不能据此把成功命令误判为失败；
+        2) 无独立 stderr 段时，识别 `命令名: ... 错误短语` 这类由 `2>&1`
+           合并后的真实 shell 报错，并排除明确的 WARNING/INFO 行。
+        """
+        text = str(value or "")
+        stderr_match = re.search(r"(?im)^\[stderr\]:[ \t]*", text)
+        if stderr_match:
+            for line in text[stderr_match.end():].splitlines():
+                candidate = line.strip()
+                if re.match(
+                    r"^(?:[\w./-]+:\s*)?(?:warning|warn|info):",
+                    candidate,
+                    re.IGNORECASE,
+                ):
+                    continue
+                if any(
+                    marker in candidate.lower()
+                    for marker in self._SHELL_STDERR_FAILURE_MARKERS
+                ):
+                    return True
+            return False
+
+        match = self._SHELL_CMD_ERROR_PATTERN.search(text)
+        if not match:
+            return False
+        candidate = match.group(0).lstrip()
+        if re.search(
+            r"^[\w./-]+:\s*(?:warning|warn|info):",
+            candidate,
+            re.IGNORECASE,
+        ):
+            return False
+        return True
+
+    def _looks_like_local_endpoint_boundary(self, text: str) -> bool:
+        """识别 shell 中访问本地/容器 HTTP 端点失败的环境边界，而非线上故障。"""
+        endpoint_markers = ("localhost", "127.0.0.1", "0.0.0.0", "/experiment/status", "/health")
+        failure_markers = (
+            "connection refused",
+            "could not connect",
+            "failed to connect",
+            "status_unavailable",
+            "health_endpoints_unavailable",
+            "returncode",
+            "curl:",
+            "wget:",
+        )
+        return any(marker in text for marker in endpoint_markers) and any(marker in text for marker in failure_markers)
 
     def _looks_like_api_path_misuse(self, text: str) -> bool:
         """识别把 HTTP API 路由当成本地文件或 shell 路径读取的错误。"""
@@ -221,8 +609,14 @@ class ToolRouter:
             "",
             "### 知识与记忆",
             "- knowledge_search(query) — 检索本地知识库",
-            "- daily_note_read(date) — 读取日记/笔记",
+            "- daily_note_read(date) — 读取日记/笔记；today 为空时改用明确 YYYY-MM-DD 复验",
             "- daily_note_write(content) — 写入成长日记",
+            "- experiment_status() — 读取本机实验任务状态快照（open_task_count/open_tasks[id,title,status,goal]/latest_task/latest_artifact）",
+            "- self_upgrade_status() — 读取自升级提案状态摘要（总数/待审批/已批准/已应用/最近提案详情）",
+            "- degradation_evidence_miner() — 对 failure_triads 中的 other_error 做关键词聚类，返回 top patterns 与修复建议",
+            "- goal_list() — 查看可用 metrics、当前开放目标、最近全部目标。反思要登记目标前先调它。",
+            "- goal_capabilities() — 查看历史已闭合的能力库，避免重复发明已掌握的改进。",
+            "- goal_register(metric, direction, target, description) — 把'X 指标改到 b'写成可度量目标，进入 改→度量→收敛 闭环；evolution 每轮自动复测，达成→闭合并沉淀能力，恶化或超限→自动放弃。反思识别出可度量改进点时应直接登记，然后专注做能改善该指标的事，不要反复重复同一类反思。",
             "",
             "### 文件与系统",
             "- file_list(path) — 列出目录文件",
@@ -241,7 +635,7 @@ class ToolRouter:
 
     def get_openai_tools_schema(self) -> list[dict]:
         """返回 OpenAI Function Calling 格式的工具定义数组，供 API 请求的 tools 参数使用"""
-        return [
+        schema: list[dict] = [
             {
                 "type": "function",
                 "function": {
@@ -358,6 +752,45 @@ class ToolRouter:
             {
                 "type": "function",
                 "function": {
+                    "name": "experiment_status",
+                    "description": "读取实验任务状态快照，返回 open_task_count、open_tasks（含每个 open task 的 id/title/status/goal）、latest_task、latest_artifact 等字段。可直接获取所有 open task 的 id，用于 self_task_update 关闭僵尸任务；比 shell_exec 访问 localhost 或 /experiment/status 更适合本机状态验证。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "self_upgrade_status",
+                    "description": "读取自升级提案状态摘要，返回 total/pending/approved/applied/rejected 计数和最近提案详情。供反思时了解自我进化管线进展。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "degradation_evidence_miner",
+                    "description": "挖掘 failure_triads.jsonl 中的 other_error/失败证据，按关键词聚类返回 top patterns、样本与最小修复建议。当 tool_failure_breakdown.other_error 偏高时应优先调用，而不是只写反思日记。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "description": "扫描最近 triad 条数，默认 200"},
+                            "min_count": {"type": "integer", "description": "模式最少出现次数，默认 1"}
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "self_task_update",
                     "description": "更新已有自我学习任务的状态并追加证据摘要。适合在 done_when 已满足时把任务从 open 标记为 closed/done，避免重复生成 artifact。若只是观察到证据不足，可使用 evidence_observed，不要声称完成。",
                     "parameters": {
@@ -393,11 +826,13 @@ class ToolRouter:
                 "type": "function",
                 "function": {
                     "name": "file_read",
-                    "description": "读取本地文件内容。不要用它读取 /health、/activity_logs、/public_chat、/experiment/status、/evolution/status 等 HTTP API 路径；这类路径必须通过接口/HTTP 证据获取。",
+                    "description": "读取本地文件内容，支持分页续读。返回值含 total_chars/truncated/next_offset：若 truncated=True，用 offset=next_offset 再次调用即可读下一段，直到把大文件（如自身源码 self_upgrade.py/tool_router.py）读全后再用 self_code_write 落地修改。不要用它读取 /health、/activity_logs、/public_chat、/experiment/status、/evolution/status 等 HTTP API 路径；这类路径必须通过接口/HTTP 证据获取。",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "文件路径"}
+                            "path": {"type": "string", "description": "文件路径"},
+                            "offset": {"type": "integer", "description": "起始字符偏移，默认 0；续读时填上一次返回的 next_offset"},
+                            "limit": {"type": "integer", "description": "本次返回的最大字符数，默认 8000，最大 40000"}
                         },
                         "required": ["path"]
                     }
@@ -459,13 +894,142 @@ class ToolRouter:
                     }
                 }
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "goal_list",
+                    "description": "列出可用 metrics、当前所有开放目标、最近 50 条全部目标。反思中要登记目标前先调用此工具，避免对同一指标重复登记，并选择正确的 metric 名。",
+                    "parameters": {"type": "object", "properties": {}, "required": []}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "goal_capabilities",
+                    "description": "列出已沉淀入工具/能力库的可复用能力（来自闭合的目标）。供反思时回顾历史成果，避免重新发明已掌握的改进。",
+                    "parameters": {"type": "object", "properties": {}, "required": []}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "goal_register",
+                    "description": "登记一个可度量改进目标，进入 改→度量→收敛 闭环。evolution 引擎每轮会用当前 metrics 复测：达成则自动闭合并沉淀进能力库；显著恶化（>20%）或超过 max_cycles 则自动放弃。AIwake 反思时若识别出'X 指标需要从 a 改到 b'，应直接调用此工具登记，然后专注于做能改善该指标的实际工作，而不是反复重复同一类反思。\n\n选择目标时的约束：\n1) 先调 goal_list 看哪些 metric 还没有 open goal，避免对同一指标重复登记。\n2) 如果某指标已经接近最优（如 tool_success_rate 已 ≥0.99，或 *_count 类已 0），不要选它做目标——选还有真实改进空间的指标，否则只是在刷分。\n3) 调 goal_capabilities 查能力库，避免重复证明已经掌握的能力。\n4) source 字段如实标注：用户对话明确要求登记=\"manual\"；反思中自主提出=\"reflection\"；实验/工具直接调用=\"tool_call\"或类似。\n5) target 必须能用现有 metric 真实测量，不要发明指标。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "metric": {
+                                "type": "string",
+                                "description": "metric 名，必须是 goal_list 返回的 metrics 之一，如 tool_success_rate / chat_success_rate / tool_failure_count / reflection_to_action_ratio 等"
+                            },
+                            "direction": {
+                                "type": "string",
+                                "enum": ["up", "down", "target"],
+                                "description": "up=越高越好，down=越低越好，target=接近 target 即可"
+                            },
+                            "target": {
+                                "type": "number",
+                                "description": "目标值。例如 tool_success_rate 设 0.99；tool_failure_count 设 0"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "用一句话说明目标来由：当前现状、想改到哪、为什么"
+                            },
+                            "source": {
+                                "type": "string",
+                                "description": "目标来源标签，默认 reflection。可填 reflection/manual/auto 等"
+                            },
+                            "max_cycles": {
+                                "type": "integer",
+                                "description": "最大复测轮数，超过仍未达成则自动放弃。默认 12，建议 4–24"
+                            }
+                        },
+                        "required": ["metric", "direction", "target", "description"]
+                    }
+                }
+            },
         ]
+        # 合并能力库注册的动态工具 schema，让 LLM 看见反思自主新增的小工具
+        for record in ToolRouter._capability_tools.values():
+            sch = record.get("schema")
+            if sch:
+                schema.append(sch)
+        return schema
+
+    @staticmethod
+    def _normalize_tool_name(tool_name: str) -> str:
+        """把工具名做安全归一化：去空白、小写匹配别名表，命中则返回真实工具名。
+
+        仅做 1:1 安全等价替换；已是真实工具名（区分大小写匹配 KNOWN_TOOLS）的不改动。
+        """
+        if not isinstance(tool_name, str):
+            return tool_name
+        name = tool_name.strip()
+        if name in KNOWN_TOOLS or name in ToolRouter._capability_tools:
+            return name
+        return _TOOL_NAME_ALIASES.get(name.lower(), name)
+
+    def _unknown_tool_guidance(self, requested_name: str) -> dict:
+        """对真正未知/幻觉的工具名返回结构化指引，而不是基础设施失败。
+
+        status=degraded（非 error）：不计入 tool_failure_count，避免“工具名笔误”
+        污染可靠性指标；同时给出可用工具清单，引导模型改用真实工具名重试。
+        """
+        available = sorted(KNOWN_TOOLS | set(ToolRouter._capability_tools.keys()))
+        result = {
+            "status": "degraded",
+            "tool": requested_name,
+            "diagnosis": "unknown_tool_name",
+            "result": (
+                f"工具 '{requested_name}' 不是本实例可用工具（很可能是工具名笔误或"
+                f"通用助手命名）。请改用下列真实工具名之一重试，不要重复调用同一个不存在的名字。"
+            ),
+            "available_tools": available,
+            "fallback_hint": (
+                "用真实工具名重试：读文件用 file_read、列目录用 file_list、"
+                "搜网用 web_search、抓网页用 web_fetch、检索记忆用 knowledge_search、"
+                "记任务用 self_task_create/self_artifact_create。"
+            ),
+            "recommended_next_actions": [
+                "从 available_tools 选一个语义等价的真实工具名重试。",
+                "若只是想记录待办，用 self_task_create 而非 TodoWrite 等外部命名。",
+                "不要把工具名笔误升级为系统故障，也不要反复重复同一不存在的工具名。",
+            ],
+        }
+        try:
+            self.store.append("events", {
+                "event": "tool_name_unknown",
+                "requested_tool": requested_name,
+                "diagnosis": "unknown_tool_name",
+            })
+        except Exception as exc:
+            logger.warning(f"[ToolRouter] 写入未知工具名事件失败: {exc}")
+        return result
 
     async def call(self, tool_name: str, params: dict) -> dict:
-        """执行工具调用（权限校验 + 直接实现）"""
+        """执行工具调用（工具名归一化 + 权限校验 + 直接实现）
+
+        见 _normalize_tool_name / _unknown_tool_guidance：把幻觉工具名安全归一化，
+        真正未知的名字返回结构化指引而非基础设施失败。
+        """
+        # 1) 工具名归一化：把大模型幻觉出的通用助手命名映射到真实工具名，
+        #    避免“工具名笔误”被错误计入 tool_failure_count。
+        original_name = tool_name
+        tool_name = self._normalize_tool_name(tool_name)
+        if tool_name != original_name:
+            logger.info("[ToolRouter] 工具名归一化: %s → %s", original_name, tool_name)
+
+        # 2) 真正未知的工具名：返回结构化使用指引（非 error），不当作基础设施失败。
+        if (
+            tool_name not in KNOWN_TOOLS
+            and tool_name not in ToolRouter._capability_tools
+            and tool_name not in HIGH_RISK_TOOLS
+        ):
+            return self._unknown_tool_guidance(original_name)
+
         allowed, risk = self._check_permission(tool_name)
         if not allowed:
-            return self._classify_failure(tool_name, {"error": f"工具 '{tool_name}' 未被当前实验配置允许", "tool": tool_name, "risk": risk})
+            return self._finalize_tool_result(tool_name, {"error": f"工具 '{tool_name}' 未被当前实验配置允许", "tool": tool_name, "risk": risk})
 
         # 路由到各工具直接实现
         try:
@@ -481,12 +1045,25 @@ class ToolRouter:
                 result = self._daily_note_read(params.get("date", "today"))
             elif tool_name == "daily_note_write":
                 result = self._daily_note_write(params.get("content", ""))
+            elif tool_name == "experiment_status":
+                result = self._experiment_status_snapshot()
+            elif tool_name == "self_upgrade_status":
+                result = self._self_upgrade_status()
+            elif tool_name == "degradation_evidence_miner":
+                result = self._degradation_evidence_miner(
+                    params.get("limit", 200),
+                    params.get("min_count", 1),
+                )
             elif tool_name in ("knowledge_search", "tag_memo"):
                 result = self._knowledge_search(params.get("query", "") or params.get("content", ""))
             elif tool_name == "file_list":
                 result = self._file_list(params.get("path", "."))
             elif tool_name == "file_read":
-                result = self._file_read(params.get("path", ""))
+                result = self._file_read(
+                    params.get("path", ""),
+                    params.get("offset", 0),
+                    params.get("limit", 8000),
+                )
             elif tool_name == "file_write":
                 result = self._file_write(params.get("path", ""), params.get("content", ""))
             elif tool_name == "file_append":
@@ -521,12 +1098,42 @@ class ToolRouter:
                 )
             elif tool_name == "schedule_read":
                 result = self._schedule_read()
+            elif tool_name == "goal_list":
+                result = self._goal_list()
+            elif tool_name == "goal_capabilities":
+                result = self._goal_capabilities()
+            elif tool_name == "goal_register":
+                result = self._goal_register(
+                    metric=params.get("metric", ""),
+                    direction=params.get("direction", ""),
+                    target=params.get("target"),
+                    description=params.get("description", ""),
+                    source=params.get("source", "reflection"),
+                    max_cycles=params.get("max_cycles", 12),
+                )
+            elif tool_name in ToolRouter._capability_tools:
+                # 反思自主写入能力库 + 注册的动态工具
+                from capability_tools import call_capability_tool
+                record = ToolRouter._capability_tools[tool_name]
+                result = call_capability_tool(record, params)
             else:
                 result = {"error": f"工具 '{tool_name}' 未实现"}
-            return self._classify_failure(tool_name, result)
+            enriched = self._finalize_tool_result(tool_name, result)
+            # rate_limited 备选降级：重试一次，重试上限1次
+            if enriched.get("failure_type") == "rate_limited" and tool_name in _RATE_LIMIT_ALTERNATIVES:
+                for alt in _RATE_LIMIT_ALTERNATIVES[tool_name]:
+                    try:
+                        await asyncio.sleep(1)
+                        alt_result = await self.call(alt, params)
+                        if alt_result.get("status") != "error":
+                            alt_result["_rate_limit_fallback_from"] = tool_name
+                            return alt_result
+                    except Exception:
+                        pass
+            return enriched
         except Exception as e:
             logger.error(f"[ToolRouter] 工具 '{tool_name}' 执行异常: {e}")
-            return self._classify_failure(tool_name, {"error": str(e), "tool": tool_name})
+            return self._finalize_tool_result(tool_name, {"error": str(e), "tool": tool_name})
 
     async def call_batch(self, tool_calls: list[dict]) -> list[dict]:
         """
@@ -759,8 +1366,72 @@ class ToolRouter:
     # ─────────────────────────────────────────────────────────────
     # Web 抓取：直接 httpx GET
     # ─────────────────────────────────────────────────────────────
+    # 自身应用域名（用于自我观察通道）：抓取这些域名时改写为容器内部端口直连，
+    # 避免 fly.io 容器内把自身域名解析为回环地址而被 SSRF 防护误拒。
+    SELF_APP_HOSTNAMES = frozenset({"aiwake.fly.dev"})
+    SELF_APP_INTERNAL_BASE = "http://127.0.0.1:8000"
+    # 自察只允许只读 GET 端点，防止经由改写通道触发内部写操作。
+    SELF_APP_ALLOWED_PATH_PREFIXES = (
+        "/health",
+        "/activity_logs",
+        "/public_chat",
+        "/state",
+        "/experiment/status",
+        "/experiment/tasks",
+        "/experiment/artifacts",
+        "/evolution/status",
+        "/growth/milestones",
+        "/goal/list",
+        "/goal/capabilities",
+        "/self-upgrade/status",
+        "/self-upgrade/proposals",
+    )
+
+    def _rewrite_self_url(self, parsed) -> Optional[str]:
+        """识别指向自身线上域名的只读端点，并改写为容器内部地址。
+
+        返回改写后的 URL；若不是自身域名或不是允许的只读端点，返回 None（走常规 SSRF 检查）。
+        """
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in self.SELF_APP_HOSTNAMES:
+            return None
+        path = parsed.path or "/"
+        if path != "/" and not any(path == p or path.startswith(p.rstrip("/") + "/") or path.startswith(p) for p in self.SELF_APP_ALLOWED_PATH_PREFIXES):
+            return None
+        query = f"?{parsed.query}" if parsed.query else ""
+        rewritten = f"{self.SELF_APP_INTERNAL_BASE}{path}{query}"
+        logger.info("[ToolRouter] web_fetch 自我观察通道：%s -> 内部端点（只读自察）", hostname + path)
+        return rewritten
+
+    async def _resolve_public_ips_for_fetch(self, hostname: str) -> tuple[bool, str]:
+        """解析主机名并校验全部地址为公网地址（SSRF 防护）。"""
+        import ipaddress
+        import socket
+
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            return False, f"DNS 解析失败: {e}"
+        except Exception as e:
+            return False, f"DNS 解析异常: {type(e).__name__}: {e}"
+
+        addresses = sorted({info[4][0] for info in infos if info and info[4]})
+        if not addresses:
+            return False, "DNS 未返回可用地址"
+        for address in addresses:
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                return False, f"DNS 返回无效地址: {address}"
+            if not ip.is_global:
+                return False, f"安全限制：目标解析到非公网地址 {address}，已拒绝抓取"
+        return True, ",".join(addresses[:4])
+
     async def _web_fetch(self, url: str) -> dict:
-        """直接 HTTP 抓取公开网页内容。包含最小 SSRF 防护、浏览器型请求头与清晰失败诊断。"""
+        """直接 HTTP 抓取公开网页内容。包含最小 SSRF 防护、浏览器型请求头与清晰失败诊断。
+
+        特例：抓取自身线上域名（自我观察）时，自动改写为容器内部只读端点，避免被 SSRF 防护误拒。
+        """
         if not url:
             return {"error": "url 参数不能为空", "tool": "web_fetch"}
 
@@ -783,35 +1454,24 @@ class ToolRouter:
                 "url": url,
             }
 
-        async def _resolve_public_ips(hostname: str) -> tuple[bool, str]:
-            try:
-                infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None, type=socket.SOCK_STREAM)
-            except socket.gaierror as e:
-                return False, f"DNS 解析失败: {e}"
-            except Exception as e:
-                return False, f"DNS 解析异常: {type(e).__name__}: {e}"
-
-            addresses = sorted({info[4][0] for info in infos if info and info[4]})
-            if not addresses:
-                return False, "DNS 未返回可用地址"
-            for address in addresses:
-                try:
-                    ip = ipaddress.ip_address(address)
-                except ValueError:
-                    return False, f"DNS 返回无效地址: {address}"
-                if not ip.is_global:
-                    return False, f"安全限制：目标解析到非公网地址 {address}，已拒绝抓取"
-            return True, ",".join(addresses[:4])
-
-        ok, dns_note = await _resolve_public_ips(parsed.hostname)
-        if not ok:
-            return {
-                "status": "error",
-                "error": dns_note,
-                "tool": "web_fetch",
-                "url": url,
-                "diagnosis": "private_network_safety_restriction" if "非公网地址" in dns_note else "dns_resolution_failure",
-            }
+        # 自我观察通道：抓取自身线上域名时，容器内 DNS 会把自身域名解析为回环地址，
+        # 直接走 SSRF 防护会被误拒。这里识别自身域名并改写为容器内部端口直连（只读自察），
+        # 不影响对其他私网/回环地址的拦截。
+        self_url_rewritten = self._rewrite_self_url(parsed)
+        if self_url_rewritten:
+            url = self_url_rewritten
+            parsed = urlparse(url)
+            dns_note = "self_app_internal"
+        else:
+            ok, dns_note = await self._resolve_public_ips_for_fetch(parsed.hostname)
+            if not ok:
+                return {
+                    "status": "error",
+                    "error": dns_note,
+                    "tool": "web_fetch",
+                    "url": url,
+                    "diagnosis": "private_network_safety_restriction" if "非公网地址" in dns_note else "dns_resolution_failure",
+                }
 
         headers = {
             "User-Agent": (
@@ -984,14 +1644,41 @@ class ToolRouter:
     def _diary_path(self, date_str: str, user_id: str = "agent") -> Path:
         if date_str in ("today", "", None):
             date_str = datetime.now().strftime("%Y-%m-%d")
+        # 防止双后缀 bug：AIwake 反思时可能传入 "2026-06-07_agent" 或 "2026-06-07_agent.md"
+        # 作为 date 参数，导致拼成 "2026-06-07_agent_agent.md"
+        if date_str.endswith(".md"):
+            date_str = date_str[:-3]
+        if date_str.endswith(f"_{user_id}"):
+            date_str = date_str[: -len(f"_{user_id}")]
         return DIARY_DIR / f"{date_str}_{user_id}.md"
 
     def _daily_note_read(self, date: str = "today") -> dict:
-        """读取本地日记文件"""
+        """读取本地日记文件（大文件只返回尾部最新内容，避免被 llm_gate 截断后丢失最新条目）"""
+        MAX_RETURN_CHARS = 6000  # llm_gate 截断为 3000，留足 JSON 信封空间
         path = self._diary_path(date)
         try:
             if path.exists():
-                content = redact_secrets(path.read_text(encoding="utf-8"))
+                raw = path.read_text(encoding="utf-8")
+                total_chars = len(raw)
+                content = redact_secrets(raw)
+                if len(content) > MAX_RETURN_CHARS:
+                    # 按 ## 标题分割，保留尾部最近的条目
+                    sections = content.split("\n## ")
+                    tail_parts: list[str] = []
+                    tail_len = 0
+                    for sec in reversed(sections):
+                        piece = ("## " + sec) if tail_parts else sec  # 第一块不加前缀（可能是文件头）
+                        if tail_len + len(piece) > MAX_RETURN_CHARS and tail_parts:
+                            break
+                        tail_parts.insert(0, piece if tail_parts else sec)
+                        tail_len += len(piece)
+                    truncated_content = "\n".join(tail_parts)
+                    # 如果按 section 切分后仍然过长，硬截断尾部
+                    if len(truncated_content) > MAX_RETURN_CHARS:
+                        truncated_content = truncated_content[-MAX_RETURN_CHARS:]
+                    header = f"[日记总长 {total_chars} 字符，已截取最近条目 {len(truncated_content)} 字符]\n\n"
+                    content = header + truncated_content
+                    logger.info(f"[ToolRouter] daily_note_read: 文件 {path.name} 共 {total_chars} 字符，截取尾部 {len(truncated_content)} 字符返回")
                 return {"status": "ok", "tool": "daily_note_read", "date": date, "result": content}
             else:
                 return {
@@ -1003,6 +1690,7 @@ class ToolRouter:
                     "fallback_hint": "使用明确 YYYY-MM-DD 日期重试，并结合 daily_note_write 日志或 knowledge_search 交叉验证。",
                 }
         except Exception as e:
+            logger.error(f"[ToolRouter] daily_note_read 失败: {e}")
             return {"error": str(e), "tool": "daily_note_read"}
 
     def _daily_note_write(self, content: str, user_id: str = "agent") -> dict:
@@ -1077,6 +1765,22 @@ class ToolRouter:
             if is_sensitive_path(fpath):
                 return {"error": "敏感路径已拦截", "tool": "file_list", "path": redact_secrets(path)}
             if not fpath.exists() or not fpath.is_dir():
+                # 与 file_read 一致：容器根目录是 /app，仓库前缀 src/agent-mind/ 在容器内
+                # 不存在。无论传入仓库相对目录(src/agent-mind/...)还是带幻觉前缀的绝对目录
+                # (/app/src/agent-mind/...)，都取 src/agent-mind/ 之后的部分在 APP_ROOT 下重试，
+                # 让 AIwake 用仓库相对/绝对路径探查自身代码结构时都能命中。
+                _APP_ROOT = Path(os.getenv("APP_ROOT", "/app"))
+                norm = str(fpath).replace("\\", "/")
+                marker = "src/agent-mind/"
+                idx = norm.find(marker)
+                if idx != -1:
+                    suffix = norm[idx + len(marker):]
+                    if suffix:
+                        fallback = _APP_ROOT / suffix
+                        if fallback.exists() and fallback.is_dir():
+                            fpath = fallback
+                            logger.info(f"[ToolRouter] file_list 路径回退(strip prefix): {path} → {fpath}")
+            if not fpath.exists() or not fpath.is_dir():
                 return {"error": f"目录不存在: {path}", "tool": "file_list"}
             items = []
             for child in sorted(fpath.iterdir())[:200]:
@@ -1085,10 +1789,54 @@ class ToolRouter:
         except Exception as e:
             return {"error": redact_secrets(str(e)), "tool": "file_list"}
 
-    def _file_read(self, path: str) -> dict:
-        """读取本地文件；若模型传入日记文件名，则自动在 DIARY_DIR 下解析。"""
+    # basename（去扩展名，归一化）→ 推荐改用的结构化状态工具
+    _STRUCTURED_STATE_TOOL_HINTS: dict[str, list[str]] = {
+        "self_upgrade_status": ["self_upgrade_status"],
+        "self_upgrade": ["self_upgrade_status"],
+        "self-upgrade-status": ["self_upgrade_status"],
+        "experiment_status": ["experiment_status"],
+        "experiment": ["experiment_status"],
+        "evolution_status": ["experiment_status", "knowledge_search"],
+        "evolution": ["experiment_status", "knowledge_search"],
+        "goal_list": ["goal_list"],
+        "goals": ["goal_list"],
+        "schedule": ["schedule_read"],
+        "schedule_read": ["schedule_read"],
+    }
+
+    def _recommend_tools_for_missing_path(self, filename: str) -> list[str]:
+        """file_not_found 时，按 basename 推断是否应改用结构化状态工具。
+
+        仅做只读诊断提示：当模型用幻觉路径（如 .../proposals/self_upgrade_status.md）
+        去 file_read 一个本质是结构化状态接口的内容时，直接给出应调用的工具名，
+        缩短自愈环。命中不了则返回空列表，保持原有 file_not_found 语义不变。
+        """
+        if not filename:
+            return []
+        stem = str(filename).rsplit(".", 1)[0].strip().lower()
+        stem = stem.replace("-", "_")
+        return list(self._STRUCTURED_STATE_TOOL_HINTS.get(stem, []))
+
+    def _file_read(self, path: str, offset: int = 0, limit: int = 8000) -> dict:
+        """读取本地文件；若模型传入日记文件名，则自动在 DIARY_DIR 下解析。
+
+        支持分页续读：offset 为起始字符偏移，limit 为本次返回的最大字符数。
+        当文件被截断时，返回 truncated=True、total_chars 与 next_offset，
+        AIwake 可据此用 offset=next_offset 继续把大文件（如 self_upgrade.py）读全，
+        避免"看不全代码不敢改"导致自我迭代闭环卡在调查阶段。
+        """
         if not path:
             return {"error": "path 参数不能为空"}
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(limit or 8000)
+        except (TypeError, ValueError):
+            limit = 8000
+        # 单次返回上限收敛到 [1, 40000]，既允许一次读更多代码，又避免被 llm_gate 截断丢尾。
+        limit = max(1, min(limit, 40000))
         path_text = str(path).strip()
         api_path_pattern = re.compile(r"^/(health|activity_logs|public_chat|experiment(?:/status|/tasks|/artifacts)?|evolution/status|state|self-upgrade(?:/status|/proposals)?)(?:[/?#].*)?$")
         looks_like_api_path = bool(api_path_pattern.match(path_text)) or (
@@ -1109,27 +1857,71 @@ class ToolRouter:
         try:
             fpath = Path(path)
             resolved_from = "direct"
-            if not fpath.exists() and not fpath.is_absolute():
-                # 线上反思经常先用 daily_note_write 写入 YYYY-MM-DD_agent.md，
-                # 随后用 file_read 读取同名文件。容器工作目录不一定是 DIARY_DIR，
-                # 因此对安全的日记文件名做一次显式回退解析，避免误报“文件不存在”。
-                safe_diary_name = re.fullmatch(r"\d{4}-\d{2}-\d{2}_[A-Za-z0-9_\-]+\.md", fpath.name or "")
-                if safe_diary_name and len(fpath.parts) == 1:
-                    diary_path = DIARY_DIR / fpath.name
-                    if diary_path.exists():
-                        fpath = diary_path
-                        resolved_from = "diary_dir"
             if not fpath.exists():
-                return {"error": f"文件不存在: {redact_secrets(path)}", "tool": "file_read", "path": redact_secrets(path), "diagnosis": "file_not_found"}
-            content = redact_secrets(fpath.read_text(encoding="utf-8", errors="replace"))
-            if len(content) > 8000:
-                content = content[:8000] + "\n...[内容已截断]"
+                # 1. 容器内实际根目录是 /app，仓库路径前缀 src/agent-mind/ 在容器内不存在；
+                #    与 self_upgrade.py 的 _resolve_file_path 逻辑保持一致，取 src/agent-mind/
+                #    之后的部分在 APP_ROOT 下重试。无论是仓库相对路径
+                #    (src/agent-mind/tool_router.py) 还是带幻觉前缀的绝对路径
+                #    (/app/src/agent-mind/evolution/self_upgrade.py)，都能命中真实文件，
+                #    收敛 file_not_found 这一慢性最大失败类别。
+                _APP_ROOT = Path(os.getenv("APP_ROOT", "/app"))
+                norm = str(fpath).replace("\\", "/")
+                marker = "src/agent-mind/"
+                idx = norm.find(marker)
+                if idx != -1:
+                    suffix = norm[idx + len(marker):]
+                    if suffix:
+                        fallback = _APP_ROOT / suffix
+                        if fallback.exists() and fallback.is_file():
+                            fpath = fallback
+                            resolved_from = "app_root_strip"
+                            logger.info(f"[ToolRouter] file_read 路径回退(strip prefix): {path} → {fpath}")
+                # 2. 日记文件名匹配回退（原有逻辑）
+                if not fpath.exists():
+                    safe_diary_name = re.fullmatch(r"\d{4}-\d{2}-\d{2}_[A-Za-z0-9_\-]+\.md", fpath.name or "")
+                    if safe_diary_name:
+                        diary_path = DIARY_DIR / fpath.name
+                        if diary_path.exists():
+                            fpath = diary_path
+                            resolved_from = "diary_dir"
+                            logger.info(f"[ToolRouter] file_read 路径回退(diary): {path} → {diary_path}")
+            if not fpath.exists():
+                not_found = {"error": f"文件不存在: {redact_secrets(path)}", "tool": "file_read", "path": redact_secrets(path), "diagnosis": "file_not_found"}
+                # 慢性盲区止损：当 file_not_found 的 basename（去扩展名）对应某个结构化状态工具时，
+                # 直接提示改用对应工具，把自愈环从“失败→反思→knowledge_search→换工具”缩短为“失败→读提示→换工具”。
+                # 仅为只读诊断增强，不改变任何工具接口语义。
+                recommended = self._recommend_tools_for_missing_path(fpath.name)
+                if recommended:
+                    not_found["recommended_tools"] = recommended
+                    not_found["recommend_reason"] = "该名称对应结构化状态工具，应直接调用工具而非 file_read 读取文件"
+                return not_found
+            full_content = redact_secrets(fpath.read_text(encoding="utf-8", errors="replace"))
+            total_chars = len(full_content)
+            window = full_content[offset:offset + limit]
+            truncated = (offset + limit) < total_chars
+            next_offset = offset + limit if truncated else None
+            if truncated:
+                window = (
+                    window
+                    + f"\n...[内容已截断: 已读 {offset}~{offset + limit}/{total_chars} 字符。"
+                    + f"如需继续，请用 file_read(path, offset={next_offset}) 续读下一段，"
+                    + "把关键代码段读全后再决定如何用 self_code_write 落地修改]"
+                )
+            elif offset > 0:
+                window = (
+                    f"...[从第 {offset} 字符续读，共 {total_chars} 字符]\n" + window
+                )
             return {
                 "status": "ok",
                 "tool": "file_read",
                 "path": redact_secrets(path),
                 "resolved_from": resolved_from,
-                "result": content,
+                "result": window,
+                "offset": offset,
+                "limit": limit,
+                "total_chars": total_chars,
+                "truncated": truncated,
+                "next_offset": next_offset,
             }
         except Exception as e:
             return {"error": redact_secrets(str(e)), "tool": "file_read"}
@@ -1188,6 +1980,14 @@ class ToolRouter:
             }
             append_growth_log(log_item)
             self.store.append("events", {"event": "self_code_modified", **log_item})
+            try:
+                record_growth_milestone(
+                    event_type="tool_self_modify",
+                    description=f"自改代码: {redact_secrets(path)} - {(audit.get('purpose') or '')[:200]}",
+                    extra={"path": redact_secrets(path), "change_summary": (audit.get("change_summary") or "")[:200]},
+                )
+            except Exception:
+                pass
             result["growth_log"] = "已写入 evolution/growth_log.jsonl"
             return redact_secrets(result)
         except Exception as e:
@@ -1220,12 +2020,228 @@ class ToolRouter:
         item = self.store.append("events", {"event": "memory_update", "content": redact_secrets(content)})
         return {"status": "ok", "tool": "memory_write", "result": item}
 
+    def _experiment_status_snapshot(self) -> dict:
+        """读取实验任务状态快照，避免用 shell/localhost 误判环境边界。"""
+        try:
+            status = self.store.status()
+            return {
+                "status": "ok",
+                "tool": "experiment_status",
+                "result": redact_secrets({
+                    "task_count": status.get("task_count", 0),
+                    "open_task_count": status.get("open_task_count", 0),
+                    "open_tasks": status.get("open_tasks", []),
+                    "artifact_count": status.get("artifact_count", 0),
+                    "latest_task": status.get("latest_task"),
+                    "latest_artifact": status.get("latest_artifact"),
+                    "next_plan": status.get("next_plan"),
+                }),
+                "fallback_hint": "若需要线上视角，再读取公开 HTTPS /experiment/status；不要用 shell_exec 访问 localhost 或把本地端点失败升级为线上故障。",
+            }
+        except Exception as e:
+            return {"status": "error", "error": redact_secrets(str(e)), "tool": "experiment_status"}
+
+    def _self_upgrade_status(self) -> dict:
+        """读取自升级提案状态摘要，供反思工具调用。"""
+        try:
+            summary = proposal_status_summary(limit=5)
+            return {
+                "status": "ok",
+                "tool": "self_upgrade_status",
+                "result": redact_secrets(summary),
+            }
+        except Exception as e:
+            return {"status": "error", "error": redact_secrets(str(e)), "tool": "self_upgrade_status"}
+
+    def _degradation_evidence_miner(self, limit: int = 200, min_count: int = 1) -> dict:
+        """对 failure_triads 做 other_error 聚类挖掘。"""
+        try:
+            from evolution.failure_triads import mine_other_error_patterns, triad_stats
+
+            try:
+                limit_i = max(10, min(1000, int(limit or 200)))
+            except (TypeError, ValueError):
+                limit_i = 200
+            try:
+                min_count_i = max(1, min(50, int(min_count or 1)))
+            except (TypeError, ValueError):
+                min_count_i = 1
+            mined = mine_other_error_patterns(
+                limit=limit_i,
+                min_count=min_count_i,
+                categories={"other_error"},
+                source="tool_router.degradation_evidence_miner",
+            )
+            stats = triad_stats(limit=limit_i)
+            return {
+                "status": "ok",
+                "tool": "degradation_evidence_miner",
+                "result": redact_secrets({
+                    **mined,
+                    "triad_stats": stats,
+                }),
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": redact_secrets(str(e)),
+                "tool": "degradation_evidence_miner",
+            }
+
+    # ── 目标闭环工具：让 AIwake 在反思中直接以工具调用方式 改→度量→收敛 ──
+
+    def _goal_list(self) -> dict:
+        """只读：列出可用 metrics、当前开放目标和最近全部目标。
+
+        AIwake 在反思中应先调此工具，看看 (1) 哪些 metric 可用，(2) 哪些目标
+        正在迭代（避免重复登记），(3) 历史目标的达成/放弃情况。
+        """
+        try:
+            metrics = {
+                k: {"direction": v[0], "description": v[1]}
+                for k, v in _GT_METRIC_REGISTRY.items()
+            }
+            return {
+                "status": "ok",
+                "tool": "goal_list",
+                "result": redact_secrets({
+                    "metrics": metrics,
+                    "open_goals": _gt_read_open_goals(),
+                    "all_goals": _gt_read_all_goals(limit=50),
+                }),
+            }
+        except Exception as e:
+            return {"status": "error", "error": redact_secrets(str(e)), "tool": "goal_list"}
+
+    def _goal_capabilities(self) -> dict:
+        """只读：列出已沉淀入工具/能力库的可复用能力（来自闭合的目标）。"""
+        try:
+            return {
+                "status": "ok",
+                "tool": "goal_capabilities",
+                "result": redact_secrets({"items": _gt_read_capabilities(limit=50)}),
+            }
+        except Exception as e:
+            return {"status": "error", "error": redact_secrets(str(e)), "tool": "goal_capabilities"}
+
+    def _goal_register(
+        self,
+        *,
+        metric: str,
+        direction: str,
+        target,
+        description: str,
+        source: str = "reflection",
+        max_cycles=12,
+    ) -> dict:
+        """登记一个可度量改进目标，进入 改→度量→收敛 闭环。
+
+        evolution 引擎每轮会用当前 metrics 复测：
+        - 达成 → 自动闭合，记录 goal_closed 重大成长 + 沉淀进能力库
+        - 未达成 → 迭代
+        - 显著恶化（>20%）或超过 max_cycles → 自动放弃
+
+        AIwake 应在反思中明确："我要把 X 指标从约 a 改到 b"，并在登记后专注
+        于做能改善该指标的事，而不是反复重复同一类反思。
+        """
+        # 参数校验前置，错误用 status=error 返回（不向上抛，保护工具循环）
+        if not metric or metric not in _GT_METRIC_REGISTRY:
+            valid = ", ".join(sorted(_GT_METRIC_REGISTRY.keys()))
+            return {
+                "status": "error",
+                "tool": "goal_register",
+                "error": f"未知 metric '{metric}'，可用: {valid}",
+            }
+        try:
+            target_f = float(target) if target is not None else None
+            if target_f is None:
+                raise ValueError("target 必须是数字")
+        except (TypeError, ValueError):
+            return {
+                "status": "error",
+                "tool": "goal_register",
+                "error": f"target 必须是数字，收到 {target!r}",
+            }
+        d = (direction or "").strip().lower()
+        if d not in ("up", "down", "target"):
+            return {
+                "status": "error",
+                "tool": "goal_register",
+                "error": f"direction 必须是 up/down/target，收到 '{direction}'",
+            }
+        if not description or not str(description).strip():
+            return {
+                "status": "error",
+                "tool": "goal_register",
+                "error": "description 不能为空，请说明这个目标的来由与用途",
+            }
+        try:
+            mc = int(max_cycles)
+        except (TypeError, ValueError):
+            mc = 12
+        try:
+            goal = _gt_register_goal(
+                metric=metric,
+                direction=d,
+                target=target_f,
+                description=str(description),
+                source=str(source or "reflection"),
+                max_cycles=max(1, min(mc, 100)),
+            )
+        except Exception as e:
+            return {"status": "error", "error": redact_secrets(str(e)), "tool": "goal_register"}
+        # 顺手记一次成长事件，让"反思 → 自主提目标"本身可见
+        try:
+            record_growth_milestone(
+                event_type="reflection_insight",
+                description=f"反思自主登记目标: {str(description)[:200]}",
+                extra={
+                    "goal_id": goal["id"],
+                    "metric": metric,
+                    "direction": d,
+                    "target": str(target_f),
+                    "source": str(source or "reflection"),
+                },
+            )
+        except Exception:
+            pass
+        return {
+            "status": "ok",
+            "tool": "goal_register",
+            "result": redact_secrets(goal),
+            "next_action_hint": "目标已进入闭环；evolution 引擎每轮会自动复测。先用 goal_list 复查，再去做能改善该指标的实际工作，不要在反思中重复登记同一目标。",
+        }
+
     def _self_task_create(self, title: str, goal: str = "") -> dict:
         item = self.store.append("tasks", {"type": "self_task", "title": title or "未命名自任务", "goal": goal, "status": "open"})
+        try:
+            record_growth_milestone(
+                event_type="experiment_completed",
+                description=f"创建自任务: {(title or '未命名')[:200]}",
+                reward_points=15,
+            )
+        except Exception:
+            pass
         return {"status": "ok", "tool": "self_task_create", "result": item}
 
     def _self_task_update(self, task_id: str, status: str, note: str = "") -> dict:
         item = self.store.append("tasks", {"id": task_id or "unknown", "type": "self_task_update", "status": status or "updated", "note": redact_secrets(note)})
+        # 当任务被关闭/完成时，记录"功能模块完成"高分里程碑（记大分）
+        _closed = (status or "").strip().lower() in {"closed", "done", "completed"}
+        if _closed:
+            try:
+                record_growth_milestone(
+                    event_type="feature_module_completed",
+                    description=f"完成功能模块: task={task_id or 'unknown'} note={(note or '')[:150]}",
+                    reward_points=100,
+                    extra={
+                        "task_id": task_id or "unknown",
+                        "note": redact_secrets(note)[:200],
+                    },
+                )
+                logger.info(f"[ToolRouter] 功能模块完成里程碑已记录: task={task_id} (奖励100分)")
+            except Exception as exc:
+                logger.warning(f"[ToolRouter] 记录功能模块完成里程碑失败: {exc}")
         return {"status": "ok", "tool": "self_task_update", "result": item}
 
     def _self_artifact_create(
@@ -1252,15 +2268,55 @@ class ToolRouter:
             "source": "tool_router.self_artifact_create",
             "status": "draft",
         })
+        try:
+            record_growth_milestone(
+                event_type="experiment_completed",
+                description=f"生成学习产物: {(title or '未命名')[:200]}",
+                reward_points=25,
+                extra={"task_id": clean_task_id, "kind": kind or "learning_artifact"},
+            )
+        except Exception:
+            pass
         return {"status": "ok", "tool": "self_artifact_create", "result": item}
 
     # ─────────────────────────────────────────────────────────────
     # Shell 执行
     # ─────────────────────────────────────────────────────────────
+    # ── 命令别名映射：容器内不可用命令 → 可用替代 ──
+    _CMD_ALIASES: dict[str, str] = {
+        "rg": "grep -r",
+        "ripgrep": "grep -r",
+        "fd": "find",
+        "bat": "cat",
+        "exa": "ls",
+    }
+
     async def _shell_exec(self, command: str, timeout: int = 30) -> dict:
         """执行 shell 命令"""
         if not command:
             return {"error": "command 参数不能为空"}
+        # ── 命令预检与降级：解析复合命令，对每个子命令的主二进制做存在性检查并自动降级 ──
+        try:
+            _precheck = precheck_command(command, extra_aliases=self._CMD_ALIASES)
+            if _precheck.substitutions:
+                command = _precheck.rewritten_command
+                _sub_summary = "; ".join(s["reason"] for s in _precheck.substitutions)
+                logger.info(f"[ToolRouter] 命令预检降级: {_sub_summary}")
+            if _precheck.missing_commands:
+                # 有无法降级的缺失命令，提前返回清晰错误
+                _missing = ", ".join(_precheck.missing_commands)
+                return {
+                    "status": "error",
+                    "tool": "shell_exec",
+                    "command": command[:200],
+                    "failure_type": "command_missing",
+                    "error": f"命令 '{_missing}' 在当前容器内不可用且无已知降级路径",
+                    "reason": "missing_binary_no_fallback",
+                    "precheck_substitutions": _precheck.substitutions,
+                }
+        except Exception as _precheck_err:
+            # 预检失败不阻塞执行
+            logger.debug(f"[ToolRouter] command_precheck skipped: {_precheck_err}")
         config = load_autonomy_config()
         risk = classify_command_risk(command)
         risks = set(risk.get("risks", []))
@@ -1272,6 +2328,41 @@ class ToolRouter:
             return {"error": "部署命令需要 EXPERIMENT_ALLOW_DEPLOY=true，已拦截", "tool": "shell_exec", "risk": risk}
         if "destructive" in risks and not config.experiment_allow_destructive:
             return {"error": "破坏性命令需要 EXPERIMENT_ALLOW_DESTRUCTIVE=true 或快照保护，已拦截", "tool": "shell_exec", "risk": risk}
+        # 预检：主二进制是否存在，若不存在直接返回 unavailable，避免被错分到 forbidden
+        # 或 aiwake_internal_tool_failure，提升 tool_router 对“环境缺失”这一失败类型的可读性。
+        try:
+            _primary_cmd = ""
+            try:
+                _tokens = shlex.split(command, posix=True)
+                if _tokens:
+                    _primary_cmd = _tokens[0]
+            except ValueError:
+                # shlex 解析失败时退化为按空白切分，避免引号异常导致预检短路
+                _parts = command.strip().split()
+                _primary_cmd = _parts[0] if _parts else ""
+            # 仅对“纯命令名”做存在性校验；带路径或带 shell 元字符的复合命令交由 shell 自行处理
+            _shell_metas = {"&&", "||", "|", ";", ">", "<", ">>", "(", ")", "`", "$("}
+            _has_meta = any(m in command for m in _shell_metas)
+            if (
+                _primary_cmd
+                and not _has_meta
+                and "/" not in _primary_cmd
+                and not _primary_cmd.startswith(".")
+                and shutil.which(_primary_cmd) is None
+            ):
+                return {
+                    "status": "error",
+                    "tool": "shell_exec",
+                    "command": risk.get("redacted_command"),
+                    "risk": risk,
+                    "classification": "unavailable",
+                    "failure_type": "unavailable",
+                    "error": f"命令 '{_primary_cmd}' 在当前容器内不可用（未找到对应二进制）",
+                    "reason": "missing_binary",
+                }
+        except Exception as _pre_e:
+            # 预检本身失败时不要阻塞真实执行，记录后继续。
+            logger.debug(f"[ToolRouter] shell_exec pre-check skipped: {_pre_e}")
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -1291,7 +2382,8 @@ class ToolRouter:
                 result += f"\n[stderr]: {err_output}"
             if len(result) > 3000:
                 result = result[:3000] + "\n...[输出已截断]"
-            return {"status": "ok", "tool": "shell_exec", "command": risk.get("redacted_command"), "risk": risk, "result": result, "returncode": proc.returncode}
+            status = "ok" if proc.returncode == 0 else "error"
+            return {"status": status, "tool": "shell_exec", "command": risk.get("redacted_command"), "risk": risk, "result": result, "returncode": proc.returncode}
         except Exception as e:
             logger.error(f"[ToolRouter] shell_exec 失败: {redact_secrets(e)}")
             return {"error": redact_secrets(str(e)), "tool": "shell_exec"}

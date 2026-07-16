@@ -15,6 +15,8 @@ def _find_agent_dir() -> Path:
     """Locate agent-mind in both the source workspace and exported repo layout."""
     here = Path(__file__).resolve()
     for parent in here.parents:
+        if (parent / "heartbeat.py").exists() and (parent / "tool_router.py").exists():
+            return parent
         if parent.name == "agent-mind":
             return parent
         candidate = parent / "src" / "agent-mind"

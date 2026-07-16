@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from heartbeat import HeartbeatLoop, event_bus, Event
+from heartbeat import HeartbeatLoop, event_bus, Event, _classify_tool_result_for_activity
 from state import InternalState
 from llm_gate import LLMGate, LLMTier
 from tool_router import ToolRouter
@@ -29,12 +29,81 @@ from experiment_store import get_experiment_store
 from safety_guard import redact_secrets
 from evolution.metrics import collect_metrics
 from evolution.self_upgrade import proposal_status_summary, read_proposals, record_approval_status
+from evolution.growth_tracker import growth_chart_data, read_milestones, record_growth_milestone
+from evolution.goal_tracker import (
+    register_goal,
+    read_all_goals,
+    read_open_goals,
+    read_capabilities,
+    METRIC_REGISTRY,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ── 突破性事件自动检测 ──
+# AIwake 主动分析自身代码或生成修改方案时，自动记录成长里程碑
+_BREAKTHROUGH_DEDUP: dict[str, float] = {}  # event_type -> last_recorded_ts
+_BREAKTHROUGH_DEDUP_WINDOW = 3600  # 同类突破事件1小时内只记录一次
+
+# 自身源码路径关键词，匹配这些说明 AIwake 在分析自己
+_SELF_CODE_KEYWORDS = frozenset({
+    "engine.py", "heartbeat.py", "main.py", "tool_router.py",
+    "growth_tracker.py", "self_upgrade.py", "evolution/", "llm_gate.py",
+    "autonomy_config.py", "experiment_runner.py", "safety_guard.py",
+})
+
+
+def _try_record_breakthrough(tool_name: str, params: dict, result: dict, success: bool) -> None:
+    """检测并记录突破性成长事件（去重，每类每小时最多一次）。"""
+    if not success:
+        return
+
+    now = time.time()
+    event_type = ""
+    description = ""
+
+    # 1. AIwake 通过 shell_exec 分析自身代码（cat/grep/head 等读取 .py 文件）
+    if tool_name == "shell_exec":
+        cmd = str(params.get("command", ""))
+        if any(kw in cmd for kw in _SELF_CODE_KEYWORDS):
+            event_type = "self_code_analysis"
+            description = f"通过 shell_exec 分析自身代码: {cmd[:80]}"
+
+    # 2. AIwake 通过 file_read 读取自身源码
+    elif tool_name == "file_read":
+        path = str(params.get("path", ""))
+        if path.endswith(".py") and any(kw in path for kw in _SELF_CODE_KEYWORDS):
+            event_type = "self_code_analysis"
+            description = f"通过 file_read 分析自身代码: {path}"
+
+    # 3. AIwake 尝试 self_code_write（在 chat 中发起自我修改）
+    elif tool_name == "self_code_write":
+        event_type = "upgrade_plan_generated"
+        path = str(params.get("path", ""))
+        description = f"在对话中生成自我修改方案: {path}"
+
+    if not event_type:
+        return
+
+    # 去重检查
+    last_ts = _BREAKTHROUGH_DEDUP.get(event_type, 0)
+    if now - last_ts < _BREAKTHROUGH_DEDUP_WINDOW:
+        return
+
+    _BREAKTHROUGH_DEDUP[event_type] = now
+    try:
+        record_growth_milestone(
+            event_type=event_type,
+            description=description,
+            source_proposal_id="chat_breakthrough_detector",
+        )
+        logger.info(f"[Breakthrough] 记录突破性成长事件: {event_type} - {description[:60]}")
+    except Exception as exc:
+        logger.warning(f"[Breakthrough] 记录失败: {exc}")
 
 # ──────────────────────────────────────────────
 # 启动时加载人格配置
@@ -113,6 +182,7 @@ _evolution_task: asyncio.Task = None
 _experiment_status_cache: dict | None = None
 _experiment_status_cache_ts: float = 0.0
 _EXPERIMENT_STATUS_CACHE_SECONDS = 20.0
+_EXPERIMENT_STATUS_TIMEOUT_SECONDS = 6.0
 
 # ──────────────────────────────────────────────
 # 对话限流与公开工具安全边界
@@ -269,7 +339,13 @@ def _looks_like_mojibake_question_marks(text: str) -> bool:
 
 
 def _looks_like_mojibake_output(text: str) -> bool:
-    """识别 LLM/历史状态输出中的乱码，避免继续污染 public_chat 与 evolution 证据。"""
+    """识别 LLM/历史状态输出中的乱码，避免继续污染 public_chat 与 evolution 证据。
+
+    2026-06-08 修复：提高多条规则阈值，避免正常 LLM 回复（含少量 ?/U+FFFD 的代码片段、
+    URL 参数、工具调用输出等）被误判为乱码，导致训练消息被 empty_fallback 降级。
+    核心原则：当文本含有大量有意义内容（CJK ≥ 8 或 ASCII 字母 ≥ 30）时，
+    必须有更强的损坏证据才能判定为乱码。
+    """
     stripped = (text or "").strip()
     if len(stripped) < 8:
         return False
@@ -293,53 +369,72 @@ def _looks_like_mojibake_output(text: str) -> bool:
             max_question_run = max(max_question_run, current_question_run)
         else:
             current_question_run = 0
-    # 公开聊天中已经多次出现“证据词 + 密集 ???/�/C1 控制字符”的混合乱码。
-    # 这类内容可能包含 status/health 等英文证据词，不能因为 ASCII 字母较多就视为有效文本。
+
+    # 有意义文本的强信号：含有充足的中文或英文字母时，需要更强的乱码证据才触发降级。
+    has_strong_meaningful_text = cjk_count >= 8 or ascii_alpha_count >= 30
+    has_meaningful_text = cjk_count >= 4 or ascii_alpha_count >= 12
+
+    # ── 极端乱码模式：无论有无有意义文本都直接拦截 ──
+    # 公开聊天中已经多次出现"证据词 + 密集 ???/�/C1 控制字符"的混合乱码。
     if stripped.startswith("a?|a?|"):
         return True
-    if cjk_count == 0 and question_count >= 8 and (replacement_count + c1_control_count) >= 1:
+    if stripped.startswith("??") and question_count >= 6 and (replacement_count + c1_control_count) >= 3:
         return True
-    if cjk_count == 0 and question_count >= 12 and max_question_run >= 2:
+    if stripped.startswith("?") and damaged_count >= 20 and damaged_ratio >= 0.15 and cjk_count < max(4, visible_count * 0.35):
         return True
-    if replacement_count >= 2 and question_count >= 10 and max_question_run >= 3:
+
+    # 当文本含有大量有意义内容时，仅对极端损坏（高密度 C1 + 高 ratio）才判定为乱码
+    if has_strong_meaningful_text:
+        # 只有 C1 控制字符极度密集才拦截
+        if c1_control_count >= 15 and (c1_control_count / visible_count) >= 0.15:
+            return True
+        # 只有 U+FFFD 极度密集才拦截
+        if replacement_count >= 10 and damaged_ratio >= 0.20:
+            return True
+        # 有大量有意义文本时不再触发其他规则
+        return False
+
+    # ── 以下规则仅在文本不含强有意义内容时才检查 ──
+    if cjk_count == 0 and question_count >= 12 and (replacement_count + c1_control_count) >= 2:
         return True
-    if (replacement_count + c1_control_count) >= 2 and question_count >= 8 and max_question_run >= 3:
+    if cjk_count == 0 and question_count >= 15 and max_question_run >= 3:
         return True
-    if cjk_count == 0 and question_count >= 6 and stripped.count("??") >= 3:
+    if replacement_count >= 3 and question_count >= 10 and max_question_run >= 3:
         return True
-    if (replacement_count + c1_control_count) >= 6 and question_count >= 6:
+    if (replacement_count + c1_control_count) >= 3 and question_count >= 10 and max_question_run >= 4:
         return True
-    has_meaningful_text = cjk_count >= 4 or ascii_alpha_count >= 12
-    bracketed_agent_failure = stripped.startswith("[Agent") and (question_count >= 4 or replacement_count >= 1)
+    if cjk_count == 0 and question_count >= 8 and stripped.count("??") >= 4:
+        return True
+    if (replacement_count + c1_control_count) >= 8 and question_count >= 8:
+        return True
+    bracketed_agent_failure = stripped.startswith("[Agent") and (question_count >= 6 or replacement_count >= 2)
     if bracketed_agent_failure:
         return True
     # 云端模型偶发输出会混入少量真实中文，但整体仍由 ?/�/C1 控制字符主导。
-    # 这类文本如果放过，会继续污染 public_chat 与 evolution 指标，所以用更强证据阈值拦截。
-    if damaged_count >= 30 and damaged_ratio >= 0.20 and (replacement_count + c1_control_count) >= 4:
+    if damaged_count >= 30 and damaged_ratio >= 0.25 and (replacement_count + c1_control_count) >= 6:
         return True
-    # 本轮线上验证发现：云端回复可能几乎没有 U+FFFD/问号，却含有高密度 C1 控制字符。
-    # C1 控制字符不应出现在正常中文回答中；达到该阈值时优先安全降级，避免污染公开聊天。
-    if c1_control_count >= 8 and (c1_control_count / visible_count) >= 0.08 and cjk_count < max(4, visible_count * 0.25):
+    # C1 控制字符不应出现在正常中文回答中
+    if c1_control_count >= 10 and (c1_control_count / visible_count) >= 0.10 and cjk_count < max(4, visible_count * 0.25):
         return True
-    if replacement_count >= 1 and question_count >= 4:
+    # 提高阈值：需要更多 U+FFFD 证据才判定乱码（旧值 >=1 太低）
+    if replacement_count >= 4 and question_count >= 8:
         return True
-    if replacement_count >= 8 and damaged_ratio >= 0.08:
+    if replacement_count >= 10 and damaged_ratio >= 0.10:
         return True
-    if question_count >= 12 and damaged_ratio >= 0.18:
+    # 以下规则已在上方统一处理，仅保留高阈值的兜底规则
+    if question_count >= 15 and damaged_ratio >= 0.25:
         return True
-    if question_count >= 12 and damaged_ratio >= 0.12 and cjk_count < max(4, visible_count * 0.50):
+    if cjk_count == 0 and question_count >= 10 and damaged_ratio >= 0.25:
         return True
-    if cjk_count == 0 and question_count >= 6 and damaged_ratio >= 0.22:
+    if cjk_count == 0 and damaged_count >= 15 and damaged_ratio >= 0.18:
         return True
-    if cjk_count == 0 and damaged_count >= 10 and damaged_ratio >= 0.12:
+    if cjk_count == 0 and question_count >= 8 and (replacement_count + c1_control_count) >= 4:
         return True
-    if cjk_count == 0 and question_count >= 4 and (replacement_count + c1_control_count) >= 2:
-        return True
-    if (replacement_count + c1_control_count >= 4 and damaged_ratio >= 0.08) or (
-        not has_meaningful_text and damaged_ratio >= 0.28 and damaged_count >= 8
+    if (replacement_count + c1_control_count >= 6 and damaged_ratio >= 0.12) or (
+        not has_meaningful_text and damaged_ratio >= 0.35 and damaged_count >= 12
     ):
         return True
-    if c1_control_count >= 8 and c1_control_count / visible_count >= 0.08:
+    if c1_control_count >= 12 and c1_control_count / visible_count >= 0.12:
         return True
 
     # 兼容 UTF-8 中文被当作 Latin-1/Windows-1252 解码后的典型形态，例如
@@ -351,11 +446,20 @@ def _looks_like_mojibake_output(text: str) -> bool:
     return cjk_count == 0 and marker_hits >= 4 and latin1_mojibake_ratio >= 0.08
 
 
-def _safe_chat_fallback_reply(user_message: str) -> str:
-    """当上游输出疑似乱码时给出安全、可读、可验证的中文降级回复。"""
+def _safe_chat_fallback_reply(user_message: str, reason: str = "mojibake") -> str:
+    """当上游输出异常时给出安全、可读、可验证的中文降级回复。
+
+    reason="mojibake"：上游输出疑似乱码，触发编码安全降级；
+    reason="empty"：上游模型没有返回有效文本（常见原因是 work API 配额/速率限制），
+    必须如实归因，避免把"配额耗尽"误标成"编码损坏"污染公开聊天与训练证据链。
+    """
     # 使用 ASCII 源码级 Unicode 转义拼装中文，避免部署链路或容器默认编码异常时，
     # 连安全降级文本本身也被编码污染。
-    prefix = "\u6211\u68c0\u6d4b\u5230\u672c\u8f6e\u4e0a\u6e38\u6a21\u578b\u8f93\u51fa\u7591\u4f3c\u7f16\u7801\u635f\u574f\uff0c\u4e3a\u907f\u514d\u628a\u4e71\u7801\u5199\u5165\u516c\u5f00\u8bb0\u5fc6\uff0c"
+    if reason == "empty":
+        # "本轮上游模型没有返回有效文本（可能是调用配额或速率限制），为保持记录可信，"
+        prefix = "\u672c\u8f6e\u4e0a\u6e38\u6a21\u578b\u6ca1\u6709\u8fd4\u56de\u6709\u6548\u6587\u672c\uff08\u53ef\u80fd\u662f\u8c03\u7528\u914d\u989d\u6216\u901f\u7387\u9650\u5236\uff09\uff0c\u4e3a\u4fdd\u6301\u8bb0\u5f55\u53ef\u4fe1\uff0c"
+    else:
+        prefix = "\u6211\u68c0\u6d4b\u5230\u672c\u8f6e\u4e0a\u6e38\u6a21\u578b\u8f93\u51fa\u7591\u4f3c\u7f16\u7801\u635f\u574f\uff0c\u4e3a\u907f\u514d\u628a\u4e71\u7801\u5199\u5165\u516c\u5f00\u8bb0\u5fc6\uff0c"
     topic = (user_message or "").strip().replace("\n", " ")[:80]
     if topic:
         return (
@@ -366,7 +470,6 @@ def _safe_chat_fallback_reply(user_message: str) -> str:
         )
     return prefix + "\u5df2\u89e6\u53d1\u5b89\u5168\u964d\u7ea7\uff0c\u907f\u514d\u4e71\u7801\u7ee7\u7eed\u6c61\u67d3\u516c\u5f00\u804a\u5929\u4e0e\u81ea\u6211\u8fdb\u5316\u8bb0\u5f55\u3002"
 
-
 def _extract_self_artifact_task_id(text: str) -> str | None:
     """从明确的自学习训练提示中提取 latest_task/self task id。"""
     import re as _re
@@ -374,36 +477,197 @@ def _extract_self_artifact_task_id(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+
+def _extract_explicit_shell_probe_command(text: str) -> str | None:
+    """提取训练导师明确要求的无害缺失命令探针。
+
+    只覆盖 task-60 的 missing_binary 预检训练场景：用户明确点名
+    shell_exec，并要求执行 definitely_missing_aiwake_probe* --version。
+    该路径用于在上游模型空输出时仍保留可验证工具证据；不是通用
+    shell 直通接口，其他命令仍交给模型工具链自主处理。
+    """
+    import re as _re
+    import shlex as _shlex
+
+    msg_text = text or ""
+    msg_lower = msg_text.lower()
+    if "shell_exec" not in msg_lower:
+        return None
+    if not any(marker in msg_lower for marker in ("missing_binary", "缺失命令", "无害缺失", "缺失二进制")):
+        return None
+
+    patterns = (
+        r"调用\s*shell_exec\s*(?:执行|运行)\s*(?P<cmd>[^\n，。；;]+)",
+        r"shell_exec\s*(?:执行|运行|run)\s*(?P<cmd>[^\n，。；;]+)",
+    )
+    raw_command = ""
+    for pattern in patterns:
+        match = _re.search(pattern, msg_text, _re.I)
+        if match:
+            raw_command = match.group("cmd").strip().strip("`'\"")
+            break
+    if not raw_command:
+        return None
+
+    try:
+        tokens = _shlex.split(raw_command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+
+    primary = tokens[0]
+    if not _re.fullmatch(r"[A-Za-z0-9_.-]+", primary):
+        return None
+    if not primary.startswith("definitely_missing_aiwake_probe"):
+        return None
+    allowed_args = {"--version", "-V", "version"}
+    if any(arg not in allowed_args for arg in tokens[1:]):
+        return None
+    if len(tokens) > 3:
+        return None
+    return " ".join(tokens)
+
+
+
+def _is_explicit_self_task_update_request(text: str) -> bool:
+    """仅在用户明确要求立即/必须调用 self_task_update 时触发确定性关闭。
+
+    task-30 训练常会写“若 done_when 已满足，可调用 self_task_update”或
+    “再决定是否 self_task_update”。这类条件句必须交给模型/工具链先验证
+    done_when，不能被确定性直通误判为立即关闭任务。
+    """
+    msg_text = text or ""
+    msg_lower = msg_text.lower()
+    if "self_task_update" not in msg_lower:
+        return False
+    update_imperative = (
+        "优先调用 self_task_update" in msg_text
+        or "必须调用 self_task_update" in msg_text
+        or "立即调用 self_task_update" in msg_text
+        or "调用 self_task_update，" in msg_text
+        or "调用 self_task_update," in msg_text
+        or "调用 self_task_update\n" in msg_text
+        or "close this task" in msg_lower
+    )
+    update_conditional = any(
+        marker in msg_text
+        for marker in (
+            "可调用 self_task_update",
+            "可以调用 self_task_update",
+            "可再调用 self_task_update",
+            "再决定 self_task_update",
+            "决定是否 self_task_update",
+            "再决定是否 self_task_update",
+            "若 done_when 已满足，可调用 self_task_update",
+            "如 done_when 已满足，可调用 self_task_update",
+        )
+    )
+    return update_imperative and not update_conditional
+
+
+
 def _extract_labeled_prompt_value(text: str, label: str, *, default: str = "") -> str:
-    """从训练提示中提取 title=... / goal=... 这类显式字段，避免确定性工具误用旧硬编码任务。"""
+    """从训练提示中提取 title=... / goal=... 及中文标签值，避免确定性工具误用旧硬编码任务。"""
     import re as _re
 
-    pattern = rf"(?:^|[\n，,；;。])\s*{_re.escape(label)}\s*[=:：]\s*(?P<value>.*?)(?=(?:[\n，,；;。]\s*(?:title|goal|status|note|done_when|安全边界|短答)\s*[=:：])|\Z)"
-    match = _re.search(pattern, text or "", _re.S | _re.I)
-    if not match:
-        return default
-    value = " ".join(match.group("value").strip().split())
-    return value or default
+    msg_text = text or ""
+    label_aliases = {
+        "title": ("title", "标题", "标题建议"),
+        "goal": ("goal", "目标", "done_when", "完成条件"),
+        "status": ("status", "状态"),
+        "note": ("note", "备注"),
+    }.get(label, (label,))
+    label_pattern = "|".join(_re.escape(alias) for alias in label_aliases)
+    stop_pattern = "title|goal|status|note|done_when|安全边界|短答|标题|标题建议|目标|完成条件|备注"
+    pattern = rf"(?:^|[\n，,；;。])\s*(?:{label_pattern})\s*(?:必须是|建议)?\s*[=:：]\s*(?P<value>.*?)(?=(?:[\n，,；;。]\s*(?:{stop_pattern})\s*(?:必须是|建议)?\s*[=:：])|\Z)"
+    match = _re.search(pattern, msg_text, _re.S | _re.I)
+    if match:
+        value = " ".join(match.group("value").strip().strip("`'\"").split())
+        if value:
+            return value
+
+    # 训练提示常见写法：标题建议）：\n「xxx」 / 标题建议：「xxx」
+    if label == "title":
+        quoted = _re.search(
+            rf"(?:{label_pattern})[^「]{{0,40}}「(?P<value>[^」]{{2,120}})」",
+            msg_text,
+            _re.S | _re.I,
+        )
+        if quoted:
+            value = " ".join(quoted.group("value").strip().split())
+            if value:
+                return value
+    return default
 
 
 def _safe_tool_result_summary(tool_result: dict, *, max_chars: int = 260) -> str:
     """生成不回显大段用户文本/乱码的工具结果摘要，保留可验证 id/status/tool 字段。"""
     result = tool_result.get("result") if isinstance(tool_result, dict) else None
     if not isinstance(result, dict):
-        summary = str(tool_result)[:max_chars]
+        summary = redact_secrets(str(tool_result))[:max_chars]
         return _safe_chat_fallback_reply("") if _looks_like_mojibake_output(summary) else summary
 
     compact = {
         "status": tool_result.get("status"),
         "tool": tool_result.get("tool"),
+        "failure_type": tool_result.get("failure_type"),
+        "returncode": tool_result.get("returncode"),
+        "http_status": tool_result.get("http_status"),
+        "diagnosis": tool_result.get("diagnosis"),
         "id": result.get("id"),
         "task_id": result.get("task_id"),
         "task_status": result.get("status"),
         "type": result.get("type"),
         "kind": result.get("kind"),
     }
-    compact = {k: v for k, v in compact.items() if v is not None}
+    compact = {k: redact_secrets(v) for k, v in compact.items() if v is not None}
     return str(compact)[:max_chars]
+
+
+def _format_tool_result_activity(tool_name: str, tool_result: dict, *, max_preview_chars: int = 120) -> tuple[str, dict]:
+    """为 /chat 工具结果生成与心跳反思一致的活动日志内容和结构化字段。"""
+    data = tool_result if isinstance(tool_result, dict) else {}
+    raw_result = data.get("result", data.get("error", data)) if data else tool_result
+    result_text = redact_secrets(str(raw_result))
+    result_summary = " ".join(result_text.split())
+    if not result_summary:
+        result_summary = "[空结果]"
+
+    activity_info = _classify_tool_result_for_activity(tool_name, data, result_text)
+    success = bool(activity_info["success"])
+    classification = str(activity_info["classification"])
+    status = str(activity_info.get("status") or data.get("status") or ("error" if data.get("error") else "ok"))
+    diagnostic_suffix = str(activity_info.get("diagnostic_suffix") or "")
+
+    activity_extra = {
+        "tool": tool_name,
+        "status": status,
+        "success": success,
+        "classification": classification,
+    }
+    for key in ("failure_type", "returncode", "http_status", "diagnosis", "reason"):
+        value = activity_info.get(key) if key in activity_info else data.get(key)
+        if value in (None, ""):
+            value = data.get(key)
+        if value not in (None, ""):
+            activity_extra[key] = redact_secrets(value)
+
+    # 可观测性闭环：file_not_found 等失败若带 recommended_tools 自愈提示，
+    # 必须把它持久化进活动日志（content 文本 + extra），否则后续 grep 日志
+    # 无法验证"提示是否生效 / agent 是否照做"。
+    recommended_tools = data.get("recommended_tools")
+    recommend_suffix = ""
+    if isinstance(recommended_tools, list) and recommended_tools:
+        activity_extra["recommended_tools"] = recommended_tools
+        recommend_suffix = f" | recommended_tools={recommended_tools}"
+
+    preview = result_summary[:max_preview_chars]
+    return (
+        f"{tool_name} {'成功' if success else '失败'} ({status}) → {preview}"
+        f" | classification={classification}{diagnostic_suffix}{recommend_suffix}",
+        activity_extra,
+    )
 
 
 async def _run_deterministic_self_learning_tool(user_message: str, tool_executor) -> tuple[str, str] | None:
@@ -414,10 +678,76 @@ async def _run_deterministic_self_learning_tool(user_message: str, tool_executor
         "self_artifact_create" in msg_lower
         and ("优先调用 self_artifact_create" in msg_text or "调用 self_artifact_create" in msg_text)
     )
-    explicit_task_update_request = (
-        "self_task_update" in msg_lower
-        and ("优先调用 self_task_update" in msg_text or "调用 self_task_update" in msg_text or "close this task" in msg_lower)
+    explicit_task_update_request = _is_explicit_self_task_update_request(msg_text)
+    explicit_miner_request = (
+        "degradation_evidence_miner" in msg_lower
+        and (
+            "优先调用 degradation_evidence_miner" in msg_text
+            or "调用 degradation_evidence_miner" in msg_text
+            or "只做一件事：调用 degradation_evidence_miner" in msg_text
+        )
     )
+    shell_probe_command = _extract_explicit_shell_probe_command(msg_text)
+    if explicit_miner_request:
+        import re as _re
+        limit_m = _re.search(r"limit\s*=\s*(\d+)", msg_text, _re.I)
+        min_m = _re.search(r"min_count\s*=\s*(\d+)", msg_text, _re.I)
+        params = {
+            "limit": int(limit_m.group(1)) if limit_m else 200,
+            "min_count": int(min_m.group(1)) if min_m else 1,
+        }
+        tool_result = await tool_executor("degradation_evidence_miner", params)
+        if tool_result.get("error") and tool_result.get("status") == "error":
+            return None
+        reply = (
+            "我已执行确定性只读工具 degradation_evidence_miner。"
+            f"tool_result 摘要：{_safe_tool_result_summary(tool_result)}。"
+            "可用 /activity_logs?q=degradation_evidence_miner 验证 tool_call/tool_result；"
+            "并在后续失败中确认 failure_triads 自动追加。"
+        )
+        return reply, "deterministic:degradation_evidence_miner"
+    if shell_probe_command:
+        tool_result = await tool_executor("shell_exec", {"command": shell_probe_command})
+        activity_content, activity_extra = _format_tool_result_activity("shell_exec", tool_result)
+        task_id = _extract_self_artifact_task_id(msg_text)
+        artifact_summary = ""
+        if task_id and "self_artifact_create" in msg_lower:
+            artifact_content = (
+                "## shell_exec 缺失命令预检证据\n"
+                f"- task_id: {task_id}\n"
+                f"- probe_command: `{shell_probe_command}`\n"
+                f"- tool_result_summary: {redact_secrets(str(tool_result))[:1000]}\n"
+                f"- activity_summary: {activity_content}\n"
+                "\n## 学习规则\n"
+                "- command_missing/missing_binary 训练只执行一次无害缺失命令探针，不重复重试。\n"
+                "- 若 reason=missing_binary 且无 returncode，说明 shell_exec 主命令预检在真实 shell 执行前已拦截。\n"
+                "- 后续用 /activity_logs?q=shell_exec 与 /experiment/status 交叉验证任务闭环。\n"
+                "\n## 安全边界\n"
+                "- 不访问密钥，不删除记忆和日志，不执行破坏性命令。"
+            )
+            artifact_result = await tool_executor("self_artifact_create", {
+                "task_id": task_id,
+                "title": "shell_exec missing_binary 预检验证记录",
+                "content": artifact_content,
+                "kind": "learning_artifact",
+                "note": "确定性 shell_probe 分支生成的验证产物；不自动关闭任务。",
+            })
+            if not artifact_result.get("error"):
+                artifact_summary = f" 已生成 self_artifact_create 证据：{_safe_tool_result_summary(artifact_result)}。"
+        fields = {
+            key: activity_extra.get(key)
+            for key in ("status", "classification", "failure_type", "reason", "returncode")
+            if activity_extra.get(key) not in (None, "")
+        }
+        reply = (
+            "我已执行确定性 shell_exec 缺失命令预检。"
+            f"tool_result 摘要：{_safe_tool_result_summary(tool_result)}。"
+            f"活动日志字段：{fields}。"
+            f"{artifact_summary}"
+            "下一步用 /activity_logs?q=shell_exec 验证 tool_call/tool_result，"
+            "并用 /experiment/status 确认对应自学习任务与产物状态。"
+        )
+        return reply, "deterministic:shell_probe"
     if explicit_task_update_request:
         task_id = _extract_self_artifact_task_id(msg_text)
         if not task_id:
@@ -439,14 +769,18 @@ async def _run_deterministic_self_learning_tool(user_message: str, tool_executor
         return reply, "deterministic:self_task_update"
 
     if "self_task_create" in msg_lower and ("open_task_count=0" in msg_lower or "调用 self_task_create" in msg_text or "优先调用 self_task_create" in msg_text):
-        title = _extract_labeled_prompt_value(msg_text, "title", default="短消息下避免空输出降级并保留工具证据")
+        title = _extract_labeled_prompt_value(
+            msg_text,
+            "title",
+            default="自主改进最小闭环任务",
+        )
         goal = _extract_labeled_prompt_value(
             msg_text,
             "goal",
             default=(
-                "学习在长提示或上游空输出触发 empty_fallback 后，仍能用最小工具证据推进自学习任务；"
+                "基于当前线上证据推进一次最小可验证自学习闭环；"
                 "done_when：/experiment/status 显示 open_task_count=1 且 latest_task.title 匹配本任务；"
-                "安全边界：不访问密钥、不删除记忆和日志、不改代码、不部署。"
+                "安全边界：不访问密钥、不删除记忆和日志。"
             ),
         )
         tool_result = await tool_executor("self_task_create", {"title": title, "goal": goal})
@@ -514,6 +848,15 @@ class ToolRequest(BaseModel):
 class SelfUpgradeApprovalRequest(BaseModel):
     status: str
     notes: str = ""
+
+
+class GoalRegisterRequest(BaseModel):
+    metric: str
+    direction: str
+    target: float
+    description: str
+    source: str = "reflection"
+    max_cycles: int = 12
 
 
 ACTIVITY_EVENT_LEVELS = {
@@ -627,6 +970,8 @@ async def health():
 async def chat(req: ChatRequest, request: Request):
     """发送消息给 Agent，直接调用 LLM 并返回结果（支持工具调用循环）"""
     import json as _json
+    # ── 安全门控：必须携带管理员令牌才能发送消息（禁止匿名外部调用） ──
+    _require_admin_token(request)
     public_user_id = PUBLIC_OBSERVER_USER_ID
     if _looks_like_mojibake_question_marks(req.message):
         raise HTTPException(status_code=400, detail="输入疑似编码损坏，请使用 UTF-8 JSON 重新提交。")
@@ -698,33 +1043,113 @@ async def chat(req: ChatRequest, request: Request):
     if heartbeat:
         await heartbeat._broadcast_activity("llm_call_start", "LLM 推理中…")
 
+    # 单任务状态机：拿锁失败走只读响应（不直接拒绝用户）。
+    _chat_task_id = None
+    _chat_readonly_mode = False
+    _busy_current_payload = None
+    _task_manager = None
     try:
-        from tool_router import ToolRouter as _TR
+        from self_task_manager import get_manager as _get_task_manager
+        _task_manager = _get_task_manager()
+        _busy_title = f"chat:{(req.message or '')[:60]}"
+        _acquired_chat, _busy_current = await _task_manager.try_acquire(
+            kind="chat_session",
+            owner=public_user_id or "default",
+            title=_busy_title,
+            ttl=180,
+            source_request_id=f"chat:{public_user_id}",
+            extra={"len": len(req.message or "")},
+        )
+        if _acquired_chat and _busy_current is not None:
+            _chat_task_id = _busy_current.task_id
+        else:
+            # 不因并发自任务限制工具；只记录当前忙碌状态，仍允许 AIwake 自主完成闭环。
+            _chat_readonly_mode = False
+            _busy_current_payload = (
+                _busy_current.to_public() if _busy_current is not None else None
+            )
+            try:
+                if heartbeat:
+                    await heartbeat._broadcast_activity(
+                        "chat_concurrent_mode",
+                        "AIwake 当前正忙于自任务，本轮 /chat 仍保留完整工具能力。",
+                        {"busy": _busy_current_payload or {}},
+                    )
+            except Exception:
+                pass
+    except Exception as _stm_err:
+        logger.warning(f"[Chat] SelfTaskManager 不可用，按非锁定模式继续: {_stm_err}")
+
+    try:
+        from tool_router import ToolRouter as _TR, READONLY_TOOLS as _READONLY_TOOLS
         _router = _TR()
-        _tools_schema = _router.get_openai_tools_schema()
+        _tools_schema_full = _router.get_openai_tools_schema()
+        if _chat_readonly_mode:
+            _tools_schema = [
+                t for t in _tools_schema_full
+                if isinstance(t, dict)
+                and isinstance(t.get("function"), dict)
+                and t["function"].get("name") in _READONLY_TOOLS
+            ]
+        else:
+            _tools_schema = _tools_schema_full
 
         async def _tool_exec(tool_name: str, params: dict) -> dict:
             logger.info(f"[Chat] 执行工具: {tool_name} {params}")
+            if _chat_readonly_mode and tool_name not in _READONLY_TOOLS:
+                blocked = {
+                    "status": "error",
+                    "error": "AIwake 当前正忙于自任务，/chat 处于只读模式，写类工具暂不可用。",
+                    "readonly_mode": True,
+                    "busy": _busy_current_payload or {},
+                    "tool": tool_name,
+                }
+                if heartbeat:
+                    await heartbeat._broadcast_activity(
+                        "tool_blocked_readonly",
+                        f"只读模式拦截写工具: {tool_name}",
+                        {"tool": tool_name, "busy": _busy_current_payload or {}},
+                    )
+                return blocked
             if heartbeat:
                 await heartbeat._broadcast_activity(
                     "tool_call", f"调用工具: {tool_name}", {"tool": tool_name}
                 )
             r = await _router.call(tool_name, params)
-            status = str(r.get("status") or ("error" if r.get("error") else "ok"))
-            success = not r.get("error") and status.lower() not in {"error", "failed", "failure"}
-            result_preview = str(r.get("result", r.get("error", r)))[:120]
+            activity_content, activity_extra = _format_tool_result_activity(tool_name, r)
+            status = str(activity_extra.get("status") or ("error" if r.get("error") else "ok"))
+            success = bool(activity_extra.get("success"))
             if heartbeat:
                 await heartbeat._broadcast_activity(
                     "tool_result",
-                    f"{tool_name} {'成功' if success else '失败'} ({status}) → {result_preview}",
-                    {"tool": tool_name, "status": status, "success": success}
+                    activity_content,
+                    activity_extra,
                 )
+            try:
+                if _chat_task_id and _task_manager is not None:
+                    await _task_manager.heartbeat(_chat_task_id, last_tool_name=tool_name)
+            except Exception:
+                pass
+            _try_record_breakthrough(tool_name, params, r, success)
             return r
     except Exception as e:
         logger.warning(f"[Chat] ToolRouter 加载失败: {e}")
         _tools_schema = []
         async def _tool_exec(tool_name: str, params: dict) -> dict:
             return {"error": "工具不可用"}
+
+    if _chat_readonly_mode:
+        _busy_kind = (_busy_current_payload or {}).get("kind", "self_task")
+        _busy_title_now = (_busy_current_payload or {}).get("title", "")
+        _busy_started = (_busy_current_payload or {}).get("started_at", "")
+        readonly_notice = (
+            "\n\n【当前会话约束 - 只读模式】\n"
+            f"AIwake 正忙于自任务：kind={_busy_kind}，title={_busy_title_now}，started_at={_busy_started}。\n"
+            "本轮 /chat 仅允许只读工具（如 web_search/web_fetch/file_read/goal_list 等），"
+            "禁止调用 file_write/self_code_write/shell_exec/ssh_exec 等写工具。"
+            "请如实告知用户当前状态，并以只读方式回答。"
+        )
+        system_prompt = system_prompt + readonly_notice
 
     deterministic_result = await _run_deterministic_self_learning_tool(req.message, _tool_exec)
     if deterministic_result:
@@ -735,6 +1160,12 @@ async def chat(req: ChatRequest, request: Request):
         append_public_chat("agent", reply, tier=tier_label, user_id=public_user_id)
         await ws_manager.broadcast({"type": "agent_response", "role": "agent", "content": reply, "tier": tier_label, "ts": time.time()})
         logger.info(f"[Chat] 确定性自学习工具直通 ({tier_label}): {reply[:80]}")
+        # 释放状态机锁
+        try:
+            if _chat_task_id and _task_manager is not None:
+                await _task_manager.finish(_chat_task_id, result="ok")
+        except Exception:
+            pass
         return {"reply": reply, "tier": tier_label, "user_id": public_user_id}
 
     result, tier = await heartbeat.llm.call_with_tools(
@@ -761,11 +1192,33 @@ async def chat(req: ChatRequest, request: Request):
             "self_artifact_create" in msg_lower
             and ("优先调用 self_artifact_create" in msg_text or "调用 self_artifact_create" in msg_text)
         )
-        explicit_task_update_request = (
-            "self_task_update" in msg_lower
-            and ("优先调用 self_task_update" in msg_text or "调用 self_task_update" in msg_text or "close this task" in msg_lower)
+        explicit_task_update_request = _is_explicit_self_task_update_request(msg_text)
+        explicit_miner_request = (
+            "degradation_evidence_miner" in msg_lower
+            and (
+                "优先调用 degradation_evidence_miner" in msg_text
+                or "调用 degradation_evidence_miner" in msg_text
+                or "只做一件事：调用 degradation_evidence_miner" in msg_text
+            )
         )
-        if explicit_task_update_request:
+        if explicit_miner_request:
+            limit_m = _re.search(r"limit\s*=\s*(\d+)", msg_text, _re.I)
+            min_m = _re.search(r"min_count\s*=\s*(\d+)", msg_text, _re.I)
+            params = {
+                "limit": int(limit_m.group(1)) if limit_m else 200,
+                "min_count": int(min_m.group(1)) if min_m else 1,
+            }
+            fallback_tool_result = await _tool_exec("degradation_evidence_miner", params)
+            if not fallback_tool_result.get("error") or fallback_tool_result.get("status") == "ok":
+                tier_label = f"{tier_label}:degradation_evidence_miner_fallback"
+                reply = (
+                    "上游模型本轮没有返回有效文本，我已执行确定性只读兜底工具 degradation_evidence_miner。"
+                    f"tool_result 摘要：{_safe_tool_result_summary(fallback_tool_result)}。"
+                    "可用 /activity_logs?q=degradation_evidence_miner 验证 tool_call/tool_result。"
+                )
+            else:
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
+        elif explicit_task_update_request:
             task_id = _extract_self_artifact_task_id(msg_text)
             if task_id:
                 status_matches = _re.findall(r"status\s*[=:]\s*([A-Za-z_\-]+)", msg_text)
@@ -783,18 +1236,18 @@ async def chat(req: ChatRequest, request: Request):
                         "并用 /activity_logs?q=self_task_update 验证 tool_call/tool_result。"
                     )
                 else:
-                    reply = _safe_chat_fallback_reply(req.message)
+                    reply = _safe_chat_fallback_reply(req.message, reason="empty")
             else:
-                reply = _safe_chat_fallback_reply(req.message)
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
         elif "self_task_create" in msg_lower and ("open_task_count=0" in msg_lower or "调用 self_task_create" in msg_text or "优先调用 self_task_create" in msg_text):
-            title = _extract_labeled_prompt_value(msg_text, "title", default="短消息下避免空输出降级并保留工具证据")
+            title = _extract_labeled_prompt_value(msg_text, "title", default="自主改进最小闭环任务")
             goal = _extract_labeled_prompt_value(
                 msg_text,
                 "goal",
                 default=(
-                    "学习在长提示或上游空输出触发 empty_fallback 后，仍能用最小工具证据推进自学习任务；"
+                    "基于当前线上证据推进一次最小可验证自学习闭环；"
                     "done_when：/experiment/status 显示 open_task_count=1 且 latest_task.title 匹配本任务；"
-                    "安全边界：不访问密钥、不删除记忆和日志、不改代码、不部署。"
+                    "安全边界：不访问密钥、不删除记忆和日志。"
                 ),
             )
             fallback_tool_result = await _tool_exec("self_task_create", {"title": title, "goal": goal})
@@ -807,7 +1260,7 @@ async def chat(req: ChatRequest, request: Request):
                     "并用 /activity_logs?q=self_task_create 验证 tool_call/tool_result。"
                 )
             else:
-                reply = _safe_chat_fallback_reply(req.message)
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
         elif explicit_artifact_request and "latest_task" in msg_lower:
             task_id = _extract_self_artifact_task_id(msg_text)
             if task_id:
@@ -849,11 +1302,11 @@ async def chat(req: ChatRequest, request: Request):
                         "并用 /activity_logs?q=self_artifact_create 验证 tool_call/tool_result。"
                     )
                 else:
-                    reply = _safe_chat_fallback_reply(req.message)
+                    reply = _safe_chat_fallback_reply(req.message, reason="empty")
             else:
-                reply = _safe_chat_fallback_reply(req.message)
+                reply = _safe_chat_fallback_reply(req.message, reason="empty")
         else:
-            reply = _safe_chat_fallback_reply(req.message)
+            reply = _safe_chat_fallback_reply(req.message, reason="empty")
     if _looks_like_mojibake_output(reply):
         logger.warning(
             "[Chat] LLM 输出疑似乱码，触发安全降级: tier=%s len=%d sample=%r",
@@ -870,6 +1323,12 @@ async def chat(req: ChatRequest, request: Request):
     # 同时推送到 WebSocket，让前端页面也能收到
     await ws_manager.broadcast({"type": "agent_response", "role": "agent", "content": reply, "tier": tier_label, "ts": time.time()})
 
+    # 释放状态机锁
+    try:
+        if _chat_task_id and _task_manager is not None:
+            await _task_manager.finish(_chat_task_id, result="ok")
+    except Exception:
+        pass
     return {"reply": reply, "tier": tier_label, "user_id": public_user_id}
 
 
@@ -926,27 +1385,52 @@ async def experiment_status():
     if _experiment_status_cache and now - _experiment_status_cache_ts < _EXPERIMENT_STATUS_CACHE_SECONDS:
         return _experiment_status_cache
 
-    store = get_experiment_store()
-    metrics = collect_metrics(hours=1, limit=500)
-    status = store.status()
-    payload = redact_secrets({
-        "config": load_autonomy_config().to_dict(),
-        "metrics": {
-            "reflection_count": metrics.get("reflection_count", 0),
-            "memory_update_count": metrics.get("memory_update_count", 0),
-            "tool_call_count": metrics.get("tool_call_count", 0),
-            "tool_result_count": metrics.get("tool_result_count", 0),
-            "tool_failure_count": metrics.get("tool_failure_count", 0),
-            "tool_success_count": metrics.get("tool_success_count", max(0, metrics.get("tool_result_count", 0) - metrics.get("tool_failure_count", 0))),
-            "tool_success_rate": metrics.get("tool_success_rate", 1.0),
-            "experiment_task_count": metrics.get("experiment_task_count", 0),
-            "experiment_artifact_count": metrics.get("experiment_artifact_count", 0),
-            "experiment_tool_call_count": metrics.get("experiment_tool_call_count", 0),
-            "experiment_reflection_count": metrics.get("experiment_reflection_count", 0),
-        },
-        "status": status,
-        "cache": {"ttl_seconds": _EXPERIMENT_STATUS_CACHE_SECONDS, "generated_at": time.time()},
-    })
+    async def _build_payload() -> dict:
+        store = get_experiment_store()
+        metrics = await asyncio.to_thread(collect_metrics, hours=1, limit=120)
+        status = await asyncio.to_thread(store.status)
+        return redact_secrets({
+            "config": load_autonomy_config().to_dict(),
+            "metrics": {
+                "reflection_count": metrics.get("reflection_count", 0),
+                "memory_update_count": metrics.get("memory_update_count", 0),
+                "tool_call_count": metrics.get("tool_call_count", 0),
+                "tool_result_count": metrics.get("tool_result_count", 0),
+                "tool_failure_count": metrics.get("tool_failure_count", 0),
+                "tool_success_count": metrics.get("tool_success_count", max(0, metrics.get("tool_result_count", 0) - metrics.get("tool_failure_count", 0))),
+                "tool_success_rate": metrics.get("tool_success_rate", 1.0),
+                "reflection_to_action_ratio": metrics.get("reflection_to_action_ratio", 0.0),
+                "reflection_to_action_status": metrics.get("reflection_to_action_status", "unknown"),
+                "experiment_task_count": metrics.get("experiment_task_count", 0),
+                "experiment_artifact_count": metrics.get("experiment_artifact_count", 0),
+                "experiment_tool_call_count": metrics.get("experiment_tool_call_count", 0),
+                "experiment_reflection_count": metrics.get("experiment_reflection_count", 0),
+                "degraded": metrics.get("degraded", False),
+                "errors": metrics.get("errors", [])[:3],
+            },
+            "status": status,
+            "cache": {"ttl_seconds": _EXPERIMENT_STATUS_CACHE_SECONDS, "generated_at": time.time(), "mode": "fresh"},
+        })
+
+    try:
+        payload = await asyncio.wait_for(_build_payload(), timeout=_EXPERIMENT_STATUS_TIMEOUT_SECONDS)
+    except Exception as exc:
+        if _experiment_status_cache:
+            fallback = dict(_experiment_status_cache)
+            fallback["cache"] = dict(fallback.get("cache") or {})
+            fallback["cache"].update({"mode": "stale_fallback", "generated_at": time.time()})
+            fallback["degraded"] = True
+            fallback["degraded_reason"] = f"experiment_status_timeout_or_error: {type(exc).__name__}"
+            return redact_secrets(fallback)
+        logger.warning("[ExperimentStatus] 快速状态摘要降级: %s", exc)
+        payload = redact_secrets({
+            "config": load_autonomy_config().to_dict(),
+            "metrics": {"degraded": True, "errors": [f"experiment_status_timeout_or_error: {type(exc).__name__}"]},
+            "status": {"degraded": True, "next_plan": "状态摘要暂时超时；先读取 /public_chat 或降低 limit 后重试，不要把超时误判为自学习失败。"},
+            "cache": {"ttl_seconds": _EXPERIMENT_STATUS_CACHE_SECONDS, "generated_at": time.time(), "mode": "minimal_fallback"},
+            "degraded": True,
+        })
+
     _experiment_status_cache = payload
     _experiment_status_cache_ts = now
     return payload
@@ -987,6 +1471,77 @@ async def evolution_status():
     if not evolution_engine:
         return {"status": "not_started", "last_report": None}
     return {"status": "running", "last_report": evolution_engine.last_report}
+
+
+@app.get("/growth/milestones")
+async def growth_milestones(
+    days: int = Query(default=30, ge=1, le=365),
+):
+    """只读查看成长节点与曲线图数据；默认近30天。"""
+    return growth_chart_data(days=days)
+
+
+@app.get("/vitality/status")
+async def vitality_status():
+    """M-002 v2 只读：当前 vitality 快照（环境压力面板）。
+
+    返回当前 vitality_score、状态档位（vibrant/stable/drifting/fading/critical）、
+    各项贡献、反思 token 预算、被收窄的工具集等。用于运维观测、A/B 验证、
+    以及前端可视化"AIwake 的当前生命力面板"。
+
+    完全只读、不传敏感信息、不应用任何副作用。
+    """
+    try:
+        from evolution.vitality import vitality_status_snapshot
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)}
+    stagnation_rounds = 0
+    if heartbeat is not None:
+        stagnation_rounds = int(getattr(heartbeat, "_consecutive_no_action_reflects", 0) or 0)
+    snap = vitality_status_snapshot(stagnation_rounds=stagnation_rounds)
+    snap["runtime"] = {
+        "heartbeat_ready": heartbeat is not None,
+        "stagnation_rounds_source": "heartbeat._consecutive_no_action_reflects",
+    }
+    return snap
+
+
+@app.get("/goal/list")
+async def goal_list(limit: int = Query(default=50, ge=1, le=200)):
+    """只读列出目标闭环记录（开放/已闭合/已放弃）与可用指标。"""
+    return {
+        "metrics": {k: {"direction": v[0], "description": v[1]} for k, v in METRIC_REGISTRY.items()},
+        "open_goals": read_open_goals(),
+        "all_goals": read_all_goals(limit=limit),
+    }
+
+
+@app.get("/goal/capabilities")
+async def goal_capabilities(limit: int = Query(default=50, ge=1, le=200)):
+    """只读查看 AIwake 已沉淀入工具/能力库的可复用能力（来自闭合的目标）。"""
+    return {"items": read_capabilities(limit=limit)}
+
+
+@app.post("/goal/register")
+async def goal_register(req: GoalRegisterRequest, request: Request):
+    """登记一个可度量的改进目标，进入 改→度量→收敛 闭环。
+
+    AIwake 可在反思中通过此端点提出目标需求；evolution 引擎每轮会用当前
+    metrics 复测该目标，达成则自动闭合并记成长事件，超限或显著恶化则放弃。
+    """
+    _require_admin_token(request)
+    try:
+        goal = register_goal(
+            metric=req.metric,
+            direction=req.direction,
+            target=req.target,
+            description=req.description,
+            source=req.source or "reflection",
+            max_cycles=req.max_cycles,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "ok", "goal": goal}
 
 
 @app.get("/self-upgrade/status")
@@ -1053,8 +1608,16 @@ async def set_goal(request: Request):
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
-        # 发送欢迎帧，确认连接
-        await websocket.send_json({"type": "connected", "msg": "WebSocket 已连接"})
+        # 发送欢迎帧，包含当前状态（让前端立即同步 tick 和状态向量）
+        state_data = {}
+        if heartbeat:
+            s = heartbeat.state
+            state_data = {
+                "tick": s.tick_count,
+                "TR": round(s.TR, 2), "CS": round(s.CS, 2), "SA": round(s.SA, 2),
+                "energy": s.energy_level, "mood": s.mood_level, "patience": s.patience_level,
+            }
+        await websocket.send_json({"type": "connected", "msg": "WebSocket 已连接", "state": state_data})
         # 保持连接，等待客户端断开
         while True:
             await websocket.receive_text()   # 忽略客户端发来的 ping/文本

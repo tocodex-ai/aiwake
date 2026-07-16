@@ -12,5 +12,17 @@ __pycache__
 .env
 .env.*
 *.log
+*.backup
+*.bak
 node_modules
 tocodex-docs
+
+# 本地/历史运行数据由 Fly volume 持久化，绝不能打进镜像。
+data/
+error_logs.txt
+flyctl_logs_dump.txt
+recent_*.txt
+
+# 运维训练载荷与历史提示不属于运行时源码。
+train_msg*.txt
+training_payload.json

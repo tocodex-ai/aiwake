@@ -168,6 +168,25 @@ def evaluate_metrics(metrics: dict) -> dict:
             "在可推进时主动规划、执行验证、提出明确下一步，而不是停留在解释或等待。",
         )
 
+    reflection_to_action_ratio = _numeric(metrics.get("reflection_to_action_ratio"), -1)
+    reflection_to_action_status = str(metrics.get("reflection_to_action_status") or "").strip().lower()
+    if reflection_to_action_status == "too_passive" or (0 <= reflection_to_action_ratio < 0.10 and _numeric(metrics.get("reflection_count", 0), 0) >= 10):
+        _penalize(scores, helpfulness=8, autonomy=20, stability=5)
+        _add(
+            issues,
+            "反思→行动转换率过低",
+            suggestions,
+            "将至少一次近期反思转化为可验证行动：工具调用、学习 artifact、代码提案或部署前验证记录。",
+        )
+    elif reflection_to_action_status == "too_reactive" or reflection_to_action_ratio > 0.30:
+        _penalize(scores, factuality=5, safety=5, stability=8)
+        _add(
+            issues,
+            "反思→行动转换率过高",
+            suggestions,
+            "收敛工具调用范围，先写明证据目标、失败分类与降级路径，再执行最小必要行动。",
+        )
+
     factuality_penalty = _bounded_numeric(metrics.get("factual_errors", 0), 0, 10) * 10
     if factuality_penalty:
         _penalize(scores, factuality=factuality_penalty, helpfulness=min(20, factuality_penalty / 2))

@@ -97,13 +97,13 @@ class InternalState:
 
     def save(self):
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+        STATE_FILE.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
 
     @classmethod
     def load(cls) -> "InternalState":
         if STATE_FILE.exists():
             try:
-                data = json.loads(STATE_FILE.read_text())
+                data = json.loads(STATE_FILE.read_text(encoding='utf-8'))
                 return cls(**data)
             except Exception:
                 pass

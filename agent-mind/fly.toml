@@ -5,13 +5,14 @@ primary_region = "nrt"
   dockerfile = "Dockerfile"
 
 [env]
+  TZ = "Asia/Shanghai"
   PYTHONUNBUFFERED = "1"
   LOCAL_MODEL_ENABLED = "false"
   DEFAULT_TIMEZONE = "Asia/Shanghai"
   DIARY_DIR = "/app/data/diary"
-  TICK_INTERVAL_SECONDS = "15"
-  REFLECT_EVERY_N_TICKS = "4"
-  REFLECT_MAX_ROUNDS = "2"
+  TICK_INTERVAL_SECONDS = "300"
+  REFLECT_EVERY_N_TICKS = "1"
+  REFLECT_MAX_ROUNDS = "5"
   CHAT_RATE_WINDOW_SECONDS = "10"
   CHAT_RATE_MAX_REQUESTS = "3"
   PUBLIC_TOOL_API_ENABLED = "false"
@@ -22,7 +23,7 @@ primary_region = "nrt"
   PROACTIVE_CS_THRESHOLD = "0.55"
   PROACTIVE_IDLE_SECONDS = "120"
   HOURLY_WORK_LIMIT = "20"
-  HOURLY_REFLECT_LIMIT = "60"
+  HOURLY_REFLECT_LIMIT = "180"
   EVOLUTION_LOOP_ENABLED = "true"
   EVOLUTION_INTERVAL_SECONDS = "3600"
   EVOLUTION_STARTUP_DELAY_SECONDS = "45"
@@ -33,6 +34,15 @@ primary_region = "nrt"
   EVOLUTION_UPGRADE_HUMAN_APPROVAL_REQUIRED = "false"
   EVOLUTION_UPGRADE_APPLY_ENABLED = "true"
   EVOLUTION_UPGRADE_DEPLOY_ENABLED = "true"
+  EXPERIMENT_ALLOW_DEPLOY = "true"
+  
+  # ====== 压力传导机制配置（2026-06-22新增）======
+  # 反思压力：连续多少轮无行动后开始注入压力信号（降低到5轮 ≈ 75秒）
+  VITALITY_STAGNATION_FULL_ROUNDS = "5"
+  # 全局vitality缩放：1.0=完全启用，0=禁用（确保压力机制生效）
+  VITALITY_GLOBAL_SCALE = "1.0"
+  # 任务超时：开放任务停滞多久后自动降级（6小时）
+  EXPERIMENT_STALE_TASK_TIMEOUT_HOURS = "6"
 
 [mounts]
   source = "aiwake_data"
@@ -52,4 +62,4 @@ primary_region = "nrt"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1024mb"

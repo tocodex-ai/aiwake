@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _find_agent_dir() -> Path:
     here = Path(__file__).resolve()
     for parent in here.parents:
+        if (parent / "heartbeat.py").exists() and (parent / "tool_router.py").exists():
+            return parent
         if parent.name == "agent-mind":
             return parent
         candidate = parent / "src" / "agent-mind"
@@ -83,6 +86,92 @@ def main() -> None:
     assert empty["status"] == "ok"
     assert empty["failure_type"] == "empty_result"
     assert "明确日期" in empty["fallback_hint"]
+
+    local_endpoint = router._classify_failure(
+        "shell_exec",
+        {
+            "status": "error",
+            "tool": "shell_exec",
+            "command": "curl http://localhost:8000/experiment/status",
+            "result": "STATUS_UNAVAILABLE",
+            "returncode": 7,
+        },
+    )
+    assert local_endpoint["failure_type"] == "local_endpoint_unavailable/environment_boundary"
+    assert "experiment_status" in local_endpoint["fallback_hint"]
+
+    search_empty = router._classify_failure(
+        "shell_exec",
+        {
+            "status": "error",
+            "tool": "shell_exec",
+            "command": "grep -rn definitely_absent_pattern /app/tool_router.py",
+            "result": "",
+            "returncode": 1,
+        },
+    )
+    assert search_empty["status"] == "ok", search_empty
+    assert search_empty["failure_type"] == "empty_result", search_empty
+    assert "无匹配" in search_empty["fallback_hint"]
+
+    with patch("tool_router.append_growth_log") as append_growth_log:
+        router._finalize_tool_result(
+            "shell_exec",
+            {
+                "status": "error",
+                "tool": "shell_exec",
+                "command": "grep -rn definitely_absent_pattern /app/tool_router.py",
+                "result": "",
+                "returncode": 1,
+            },
+        )
+    append_growth_log.assert_called_once()
+    assert append_growth_log.call_args.args[0]["event"] == "tool_success_audit"
+
+    with patch("tool_router.append_growth_log") as append_growth_log:
+        audit_result = router._finalize_tool_result(
+            "web_fetch",
+            {
+                "status": "error",
+                "tool": "web_fetch",
+                "url": "https://example.com/flaky",
+                "http_status": 503,
+                "error": "目标站点返回 HTTP 503 Service Unavailable",
+            },
+        )
+    assert audit_result["failure_type"] == "rate_limited"
+    append_growth_log.assert_called_once()
+    audit_item = append_growth_log.call_args.args[0]
+    assert audit_item["event"] == "tool_failure_audit"
+    assert audit_item["tool"] == "web_fetch"
+    assert audit_item["failure_type"] == "rate_limited"
+    assert "退避" in audit_item["fallback_hint"]
+
+    with patch("tool_router.append_growth_log") as append_growth_log:
+        router._finalize_tool_result(
+            "daily_note_read",
+            {
+                "status": "ok",
+                "tool": "daily_note_read",
+                "result": "[today 暂无日记]",
+            },
+        )
+    append_growth_log.assert_called_once()
+    assert append_growth_log.call_args.args[0]["event"] == "tool_success_audit"
+
+    fallback_cases = [
+        ("knowledge_search", "backend unavailable", "data_retrieval_failure"),
+        ("file_write", "write backend unavailable", "state_mutation_failure"),
+        ("goal_list", "query backend unavailable", "state_query_failure"),
+        ("custom_tool", "invalid schema format", "schema_validation_failure"),
+        ("custom_tool", "opaque backend failure", "unknown_error"),
+    ]
+    for tool_name, error, expected in fallback_cases:
+        classified = router._classify_failure(
+            tool_name,
+            {"status": "error", "tool": tool_name, "error": error},
+        )
+        assert classified["failure_type"] == expected, classified
 
     print("tool_router_failure_classification_selfcheck: ok")
 
